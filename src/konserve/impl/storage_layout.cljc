@@ -37,7 +37,14 @@
            return-buffer    (js/Uint8Array. header-size)] ;;possibly sparse?
        (dotimes [i (alength env-array)]
          (aset return-buffer i (aget env-array i)))
-       (aset return-buffer 4 meta)
+       ;; meta-size as 4-byte big-endian at bytes 4-7, matching the CLJ
+       ;; `.putInt` above. (Historically CLJS wrote a single byte at offset
+       ;; 4, silently wrapping for meta >= 256; parse-header carries a
+       ;; legacy sniff for blobs written by that encoding.)
+       (aset return-buffer 4 (bit-and (unsigned-bit-shift-right meta 24) 0xff))
+       (aset return-buffer 5 (bit-and (unsigned-bit-shift-right meta 16) 0xff))
+       (aset return-buffer 6 (bit-and (unsigned-bit-shift-right meta 8) 0xff))
+       (aset return-buffer 7 (bit-and meta 0xff))
        return-buffer)))
 
 #_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
@@ -56,6 +63,24 @@
       (not= 0 (aget bs 18))
       (not= 0 (aget bs 19))))
 
+(defn read-meta-size
+  "Read the meta-size field from header bytes 4-7 (big-endian 32-bit int,
+  the format CLJ has always written and CLJS writes since the BE32 fix).
+
+  Legacy sniff: pre-fix CLJS `create-header` wrote meta-size as a SINGLE
+  byte at offset 4 (bytes 5-7 left zero). If byte 4 is non-zero while
+  bytes 5-7 are all zero, this is that legacy 1-byte encoding — the same
+  bit pattern interpreted as BE32 would mean a meta section >= 16 MiB,
+  which never occurs in practice, so the sniff cannot collide with a
+  genuine BE32 value."
+  [header-bytes]
+  (let [b #?(:clj (fn [i] (bit-and (aget ^bytes header-bytes (int i)) 0xff))
+             :cljs (fn [i] (aget header-bytes i)))
+        b4 (b 4) b5 (b 5) b6 (b 6) b7 (b 7)]
+    (if (and (not (zero? b4)) (zero? b5) (zero? b6) (zero? b7))
+      b4 ;; legacy CLJS 1-byte encoding
+      (+ (* b4 16777216) (* b5 65536) (* b6 256) b7))))
+
 (defn parse-header
   "Inverse function to create-header. serializers are a map of serializer-id to
   instance that are potentially initialized with custom handlers by the store
@@ -73,7 +98,7 @@
            serializer-id (.get bb 1)
            compressor-id (.get bb 2)
            encryptor-id (.get bb 3)
-           meta-size (.getInt bb 4)
+           meta-size (read-meta-size header-bytes)
            ;; was used temporarily at some point during 0.6.0-alpha (JVM only)
            small-header-size 8
            actual-header-size (if (and (= version 1)
@@ -115,7 +140,7 @@
            serializer-id (aget header-bytes 1)
            compressor-id (aget header-bytes 2)
            encryptor-id (aget header-bytes 3)
-           meta-size (aget header-bytes 4)
+           meta-size (read-meta-size header-bytes)
            serializer (serializers (byte->key serializer-id))
            compressor (byte->compressor compressor-id)
            encryptor (byte->encryptor encryptor-id)]
