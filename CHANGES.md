@@ -1,10 +1,10 @@
-# CHANGES — konserve sync-only fork
+# CHANGES — Seon compatibility fork
 
-Modifications on the `sync-only` branch relative to upstream tag `0.9.340`.
+## 0.9.356-seon.1
 
-For full per-commit detail: `git log 0.9.340..sync-only`.
-
-## Branch initial setup
-
-- Added `NOTICE.md` documenting fork attribution, scope, and EPL-1.0 compliance.
-- Added this `CHANGES.md`.
+- Merge upstream Konserve 0.9.356, including ordered `multi-assoc` batches and
+  per-write metadata.
+- Share metadata-size header decoding across Clojure and ClojureScript so both
+  runtimes can read legacy one-byte ClojureScript headers.
+- Publish the fork's version from its own classpath resources when consumed as
+  a Git dependency.

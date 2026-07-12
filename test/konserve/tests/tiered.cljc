@@ -62,6 +62,46 @@
         (is (= {:value 44} (<?- (k/get-in backend-store [:test-key]))))
         (is (= {:value 44} (<?- (k/get-in store [:test-key]))))))))
 
+(defn test-frontend-only-async
+  "Cache mode: :frontend-only writes + :frontend-first reads. Writes/deletes land in
+   the frontend only (backend is read-only truth), reads fall through on a miss, and
+   -keys reports the frontend."
+  [frontend-store backend-store]
+  (go
+    (testing "Frontend-only (cache) write policy"
+      (let [store (<?- (tiered/connect-tiered-store frontend-store backend-store
+                                                    :write-policy :frontend-only
+                                                    :read-policy :frontend-first))]
+        ;; writes land in the frontend ONLY — the backend is never touched
+        (<?- (k/assoc-in store [:cached] {:v 1}))
+        (is (= {:v 1} (<?- (k/get-in frontend-store [:cached]))) "write went to frontend")
+        (is (nil? (<?- (k/get-in backend-store [:cached]))) "backend NOT written")
+        (is (= {:v 1} (<?- (k/get-in store [:cached]))) "reads from frontend")
+        ;; a key that exists only in the backend (and hasn't been read/cached yet)
+        (<?- (k/assoc-in backend-store [:only-backend] {:v 2}))
+        ;; -keys reports the FRONTEND (the local cache), not the read-only backend
+        (let [ks (set (map :key (<?- (k/keys store))))]
+          (is (contains? ks :cached) "keys includes the cached key")
+          (is (not (contains? ks :only-backend)) "keys excludes the not-yet-cached backend key"))
+        ;; reading it falls through (frontend-first) and warms the frontend cache
+        (is (= {:v 2} (<?- (k/get-in store [:only-backend]))) "cold read falls through to backend")
+        ;; The warm is deliberately FIRE-AND-FORGET — warming must not block the read — so
+        ;; poll for it instead of assuming it has already landed. Asserting immediately is a
+        ;; race: it wins on a fast machine and loses under CI load.
+        (let [warmed (loop [tries 0]
+                       (let [v (<?- (k/get-in frontend-store [:only-backend]))]
+                         (cond
+                           (some? v)   v
+                           (>= tries 100) nil
+                           :else (do (<! (timeout 20))
+                                     (recur (inc tries))))))]
+          (is (= {:v 2} warmed) "read-through warmed the frontend"))
+        ;; dissoc removes from the frontend ONLY — a backend copy is untouched
+        (<?- (k/assoc-in backend-store [:cached] {:v 99}))
+        (<?- (k/dissoc store :cached))
+        (is (nil? (<?- (k/get-in frontend-store [:cached]))) "dissoc removed from frontend")
+        (is (= {:v 99} (<?- (k/get-in backend-store [:cached]))) "backend copy untouched by dissoc")))))
+
 (defn test-read-policies-async [frontend-store backend-store]
   (go
     (testing "Frontend-first policy"

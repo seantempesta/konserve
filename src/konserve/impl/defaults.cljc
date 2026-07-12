@@ -7,7 +7,7 @@
    [konserve.serializers :refer [key->serializer]]
    [konserve.compressor :refer [get-compressor]]
    [konserve.encryptor :refer [get-encryptor]]
-   [konserve.protocols :refer [PEDNKeyValueStore -exists?
+   [konserve.protocols :refer [PEDNKeyValueStore
                                PBinaryKeyValueStore
                                -serialize -deserialize
                                PAssocSerializers
@@ -25,12 +25,13 @@
                                          PBackingLock -release
                                          PMultiWriteBackingStore -multi-write-blobs -multi-delete-blobs
                                          PMultiReadBackingStore -multi-read-blobs
+                                         PReadMissSafe store-key-not-found?
                                          default-version
                                          parse-header create-header header-size]]
    [konserve.utils  #?@(:clj [:refer [async+sync *default-sync-translation*]]
                         :cljs [:refer [*default-sync-translation*] :refer-macros [async+sync]])]
    [superv.async :refer [go-try- <?-]]
-   [taoensso.timbre :refer [trace]])
+   [replikativ.logging :as log])
   #?(:clj
      (:import
       [java.io ByteArrayOutputStream ByteArrayInputStream])))
@@ -86,7 +87,7 @@
                           (str store-key ".new"))
           backup-store-key (str store-key ".backup")
           _ (when (and (:in-place? config) (not (:no-backup? config))) ;; let's back things up before writing then
-              (trace "backing up to blob: " backup-store-key " for key " key)
+              (log/trace :konserve/backup-blob {:backup-store-key backup-store-key :key key})
               (<?- (-copy backing store-key backup-store-key env)))
           meta-arr             (to-array meta)
           meta-size            (count meta-arr)
@@ -102,21 +103,21 @@
             (<?- (-write-value new-blob value-arr meta-size env))))
 
         (when (:sync-blob? config)
-          (trace "syncing for " key)
+          (log/trace :konserve/syncing-blob {:key key})
           (<?- (-sync new-blob env)))
         (<?- (-close new-blob env))
 
         (when-not (:in-place? config)
-          (trace "moving blob: " key)
+          (log/trace :konserve/moving-blob {:key key})
           (<?- (-atomic-move backing new-store-key store-key env)))
 
         (when (:sync-blob? config)
-          (trace "syncing store for " key)
+          (log/trace :konserve/syncing-store {:key key})
           (<?- (-sync-store backing env)))
 
         ;; Clean up backup after successful write
         (when (and (:in-place? config) (not (:no-backup? config)))
-          (trace "deleting backup blob: " backup-store-key " for key " key)
+          (log/trace :konserve/deleting-backup-blob {:backup-store-key backup-store-key :key key})
           (<?- (-delete-blob backing backup-store-key env)))
 
         (if (= operation :write-edn) [old-value value] true)
@@ -189,27 +190,42 @@
         :read-binary (<?- (-read-binary blob meta-size locked-cb env)))))))
 
 (defn delete-blob
-  "Remove/Delete key-value pair of backing store by given key. If success it will return true."
+  "Remove/Delete key-value pair of backing store by given key. Returns true if the
+   key existed and was deleted, false if it was absent.
+
+   The -blob-exists? probe reports existed?/false-for-missing (konserve's contract,
+   enforced by the compliance suite). Callers that DON'T need that boolean — e.g.
+   datahike GC's bulk sweep — can pass `:ignore-existence? true` in opts: on a
+   PReadMissSafe backing (whose -delete-blob is idempotent) this skips the probe and
+   returns true, saving a round-trip (an S3 HEAD before the DELETE). On other
+   backings the hint is ignored and the probe stays (a local stat is cheap, and
+   -delete-blob there is not guaranteed idempotent)."
   [backing env]
   (async+sync
    (:sync? env) *default-sync-translation*
    (go-try-
-    (let [{:keys [key-vec base]} env
+    (let [{:keys [key-vec base ignore-existence?]} env
           key          (first key-vec)
           store-key    (key->store-key key)
-          blob-exists? (<?- (-blob-exists? backing store-key env))]
-      (if blob-exists?
-        (try
-          (<?- (-delete-blob backing store-key env))
-          true
-          (catch #?(:clj Exception :cljs js/Error) e
-            (throw (ex-info "Could not delete key."
-                            {:key key
-                             :base base
-                             :exception e}))))
-        false)))))
+          on-error     (fn [e] (ex-info "Could not delete key."
+                                        {:key key :base base :exception e}))]
+      (if (and ignore-existence? (satisfies? PReadMissSafe backing))
+        ;; opt-in fast path: no existed? boolean needed, idempotent delete.
+        (try (<?- (-delete-blob backing store-key env)) true
+             (catch #?(:clj Exception :cljs js/Error) e (throw (on-error e))))
+        (if (<?- (-blob-exists? backing store-key env))
+          (try (<?- (-delete-blob backing store-key env)) true
+               (catch #?(:clj Exception :cljs js/Error) e (throw (on-error e))))
+          false))))))
 
 (def ^:const max-lock-attempts 100)
+
+(def ^:private not-found-sentinel
+  "Internal marker distinguishing a missing key from a stored nil value on the
+  read path. Threaded through `io-operation` as `:not-found` so `-get-in` can
+  avoid a separate existence probe (an extra HEAD round-trip per read on
+  remote backends such as S3)."
+  #?(:clj (Object.) :cljs (js-obj)))
 
 (defn get-lock [this store-key env]
   (async+sync
@@ -220,7 +236,7 @@
       (let [[l e] (try
                     [(<?- (-get-lock this env)) nil]
                     (catch #?(:clj Exception :cljs js/Error) e
-                      (trace "Failed to acquire lock: " e)
+                      (log/trace :konserve/lock-acquire-failed {:error e})
                       [nil e]))]
 
         (if-not (nil? l)
@@ -252,44 +268,104 @@
           store-key     (key->store-key key)
           env           (assoc env :store-key store-key :header-size header-size)
           serializer    (get serializers default-serializer)
-          store-key-exists? (<?- (-blob-exists? backing store-key env))
           migration-key (<?- (-migratable backing key store-key env))
+          read-op?      (or (= :read-edn operation) (= :read-binary operation) (= :read-meta operation))
+          write-op?     (or (= :write-edn operation) (= :write-binary operation))
+          ;; A PReadMissSafe backing reports an absent key cleanly from the read
+          ;; itself (an absent key throws store-key-not-found-ex), so the
+          ;; -blob-exists? probe is a wasted round-trip (an S3 HEAD) whenever we
+          ;; touch the blob anyway. Requires no pending migration (that branch
+          ;; needs the existence answer independently).
+          ;; `-migratable` returns a migration key (truthy) or a falsy no-migration
+          ;; marker — some backends use nil, some false — so test truthiness, not nil?.
+          miss-safe?    (and (satisfies? PReadMissSafe backing) (not migration-key))
+          ;; Skip the probe when its answer is not needed:
+          ;; - a full-overwrite WRITE writes regardless and never reads the old value;
+          ;; - a READ on a miss-safe backing learns existence from the read itself;
+          ;; - a NON-overwrite WRITE (update-in / update / nested assoc-in / bassoc)
+          ;;   reads the old value regardless, and on a miss-safe backing that read
+          ;;   establishes existence — so the probe is redundant there too (HEAD+GET+PUT
+          ;;   collapses to GET+PUT on a hit). The old-read below becomes read-first.
+          skip-read-probe?  (and read-op? miss-safe?)
+          skip-write-probe? (and write-op? (not overwrite?) miss-safe?)
+          skip-exists?  (or (and overwrite? write-op? (not migration-key))
+                            skip-read-probe?
+                            skip-write-probe?)
+          store-key-exists? (when-not skip-exists?
+                              (<?- (-blob-exists? backing store-key env)))
           max-retries (get-in config [:optimistic-locking-retries] 0)]
-      (if (and (not store-key-exists?) migration-key)
+      (cond
+        ;; Read-first (PReadMissSafe): no existence probe — read the blob and
+        ;; treat an absent key (store-key-not-found-ex) as the caller's
+        ;; not-found. One round-trip on remote stores instead of HEAD + GET. A
+        ;; genuinely stored nil still comes back as nil (the read succeeds),
+        ;; distinct from the not-found sentinel.
+        skip-read-probe?
+        (let [blob (<?- (-create-blob backing store-key env))
+              lock (when (:lock-blob? config)
+                     (log/trace :konserve/acquiring-blob-lock {:key key :blob (str blob)})
+                     (<?- (get-lock blob (first key-vec) env)))]
+          (try
+            (<?- (read-blob blob read-handlers serializers env))
+            (catch #?(:clj Exception :cljs js/Error) e
+              (if (store-key-not-found? e) (:not-found env) (throw e)))
+            (finally
+              (when (:lock-blob? config)
+                (log/trace :konserve/releasing-blob-lock {:key (first key-vec) :blob (str blob)})
+                (<?- (-release lock env)))
+              (<?- (-close blob env)))))
+
+        (and (not store-key-exists?) migration-key)
         (<?- (-migrate backing migration-key key-vec serializer read-handlers write-handlers env))
-        (if (or store-key-exists? (= :write-edn operation) (= :write-binary operation))
+
+        (or store-key-exists? write-op?)
           ;; Retry loop for optimistic locking conflicts
-          (loop [attempt 0]
-            (let [result
-                  (try
-                    (let [blob (<?- (-create-blob backing store-key env))
-                          lock   (when (:lock-blob? config)
-                                   (trace "Acquiring blob lock for: " key (str blob))
-                                   (<?- (get-lock blob (first key-vec) env)))]
-                      (try
-                        (let [old (if (and (or store-key-exists? (pos? attempt)) (not overwrite?))
-                                    (<?- (read-blob blob read-handlers serializers env))
-                                    [nil nil])]
-                          (if (or (= :write-edn operation) (= :write-binary operation))
-                            (<?- (update-blob backing store-key serializer write-handlers env old))
-                            old))
-                        (finally
-                          (when (:lock-blob? config)
-                            (trace "Releasing lock for " (first key-vec) (str blob))
-                            (<?- (-release lock env)))
-                          (<?- (-close blob env)))))
-                    (catch #?(:clj Exception :cljs js/Error) e
-                      (if (and (pos? max-retries)
-                               (= :optimistic-lock-conflict (:type (ex-data e)))
-                               (< attempt max-retries))
-                        ::retry
-                        (throw e))))]
-              (if (= result ::retry)
-                (do
-                  (trace "Optimistic lock conflict on " key ", retrying attempt " (inc attempt) " of " max-retries)
-                  (recur (inc attempt)))
-                result)))
-          nil))))))
+        (loop [attempt 0]
+          (let [result
+                (try
+                  (let [blob (<?- (-create-blob backing store-key env))
+                        lock   (when (:lock-blob? config)
+                                 (log/trace :konserve/acquiring-blob-lock {:key key :blob (str blob)})
+                                 (<?- (get-lock blob (first key-vec) env)))]
+                    (try
+                      (let [old (cond
+                                  ;; full overwrite never needs the old value
+                                  overwrite? [nil nil]
+                                  ;; miss-safe non-overwrite write: no probe was done, so
+                                  ;; read-first and treat an absent key as a fresh write.
+                                  skip-write-probe?
+                                  (try (<?- (read-blob blob read-handlers serializers env))
+                                       (catch #?(:clj Exception :cljs js/Error) e
+                                         (if (store-key-not-found? e) [nil nil] (throw e))))
+                                  ;; probe said the key exists (or this is a retry): read old
+                                  (or store-key-exists? (pos? attempt))
+                                  (<?- (read-blob blob read-handlers serializers env))
+                                  :else [nil nil])]
+                        (if write-op?
+                          (<?- (update-blob backing store-key serializer write-handlers env old))
+                          old))
+                      (finally
+                        (when (:lock-blob? config)
+                          (log/trace :konserve/releasing-blob-lock {:key (first key-vec) :blob (str blob)})
+                          (<?- (-release lock env)))
+                        (<?- (-close blob env)))))
+                  (catch #?(:clj Exception :cljs js/Error) e
+                    (if (and (pos? max-retries)
+                             (= :optimistic-lock-conflict (:type (ex-data e)))
+                             (< attempt max-retries))
+                      ::retry
+                      (throw e))))]
+            (if (= result ::retry)
+              (do
+                (log/trace :konserve/optimistic-lock-retry {:key key :attempt (inc attempt) :max-retries max-retries})
+                (recur (inc attempt)))
+              result)))
+
+        :else
+        ;; Key is missing (and not migratable). Read callers that need to
+        ;; distinguish a missing key from a stored nil pass a `:not-found`
+        ;; sentinel; everyone else keeps getting nil as before.
+        (:not-found env))))))
 
 (defn list-keys
   "Return all keys in the store."
@@ -314,7 +390,7 @@
                                    env         (update-in env [:msg :keys] (fn [_] store-key))
                                    env    (assoc env :store-key store-key)
                                    lock   (when (and (:in-place? config) (:lock-blob? config))
-                                            (trace "Acquiring blob lock for: " store-key (str blob))
+                                            (log/trace :konserve/acquiring-blob-lock {:store-key store-key :blob (str blob)})
                                             (<?- (-get-lock blob env)))
                                    keys-new (try (conj keys (<?- (read-blob blob read-handlers serializers env)))
                                                      ;; it can be that the blob has been deleted, ignore reading errors
@@ -327,7 +403,7 @@
                              (catch #?(:clj Exception :cljs js/Error) e
                                ;; If anything fails during key enumeration (blob creation, read, or cleanup),
                                ;; skip this key and continue. This handles concurrent deletes/modifications.
-                               (trace "Skipping key during enumeration due to:" store-key (ex-message e))
+                               (log/trace :konserve/skipping-key-enumeration {:store-key store-key :error (ex-message e)})
                                keys))]
               (recur keys-new store-keys))
 
@@ -413,23 +489,28 @@
        sync?
        *default-sync-translation*
        (go-try-
-        (if (<?- (-exists? this (first key-vec) opts))
-          (let [a (<?-
-                   (io-operation this serializers read-handlers write-handlers
-                                 {:key-vec key-vec
-                                  :operation :read-edn
-                                  :compressor compressor
-                                  :encryptor encryptor
-                                  :format    :data
-                                  :version version
-                                  :sync? sync?
-                                  :buffer-size buffer-size
-                                  :config config
-                                  :default-serializer default-serializer
-                                  :msg       {:type :read-edn-error
-                                              :key  key}}))]
-            (clojure.core/get-in a (rest key-vec)))
-          not-found)))))
+        ;; No upfront -exists? probe: io-operation already checks blob
+        ;; existence (and migratability) exactly once and returns the
+        ;; :not-found sentinel for missing keys. The previous double probe
+        ;; cost an extra HEAD request per read on remote backends.
+        (let [a (<?-
+                 (io-operation this serializers read-handlers write-handlers
+                               {:key-vec key-vec
+                                :operation :read-edn
+                                :compressor compressor
+                                :encryptor encryptor
+                                :format    :data
+                                :version version
+                                :sync? sync?
+                                :buffer-size buffer-size
+                                :config config
+                                :default-serializer default-serializer
+                                :not-found not-found-sentinel
+                                :msg       {:type :read-edn-error
+                                            :key  key}}))]
+          (if (identical? a not-found-sentinel)
+            not-found
+            (clojure.core/get-in a (rest key-vec))))))))
   (-get-meta [this key opts]
     (let [{:keys [sync?]} opts]
       (io-operation this serializers read-handlers write-handlers
@@ -491,6 +572,7 @@
                   :default-serializer default-serializer
                   :config     config
                   :sync?      (:sync? opts)
+                  :ignore-existence? (:ignore-existence? opts)
                   :buffer-size buffer-size
                   :msg        {:type :deletion-error
                                :key  key}}))

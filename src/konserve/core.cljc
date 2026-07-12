@@ -12,7 +12,7 @@
             [konserve.impl.defaults :as defaults]
             [konserve.store :as store]
             [superv.async :refer [go-try- <?-]]
-            [taoensso.timbre :refer [trace #?(:cljs debug)]])
+            [replikativ.logging :as log])
   #?(:cljs (:require-macros [konserve.core :refer [go-locked locked maybe-go-locked maybe-locked]])))
 
 ;; ACID
@@ -36,7 +36,8 @@
     :key-vec <full key path> (for assoc-in/update-in)
     :value <written value>
     :old-value <previous value> (for update operations)
-    :kvs <map of key->value> (for multi-assoc)}
+    :kvs <the multi-assoc batch, forwarded VERBATIM — a map, or an ordered seq of
+          [k v] pairs whose order is the apply order (see multi-assoc)>}
 
    Parameters:
    - store: A store implementing PWriteHookStore
@@ -73,50 +74,135 @@
   [store]
   (-lock-free? store))
 
-(defn get-lock [{:keys [locks] :as store} key]
+;; --- In-process per-key lock registry ----------------------------------------
+;; SOLID via Clojure protocols + records: callers (get-lock / release-lock and the
+;; locked / go-locked macros) depend on the PLockRegistry abstraction (DIP), not on
+;; the concrete map; the locking strategy is a substitutable record (LSP) and new
+;; strategies are added without touching callers (OCP).
+
+(defprotocol PLockRegistry
+  "Per-key in-process lock lifecycle. A lock is a core.async channel used as a
+   binary semaphore (holds one :unlocked token while free)."
+  (-acquire-lock [this key]
+    "Register intent on `key` and return its unlocked semaphore channel.")
+  (-release-lock [this key]
+    "Release `key`; reclaim the registry entry once no holder remains. Returns nil."))
+
+;; Pure registry calculations — no I/O, trivially unit-testable ----------------
+
+(defn- unlocked-chan
+  "A fresh channel preloaded with one :unlocked semaphore token."
+  []
+  (let [c (chan)]
+    (put! c :unlocked)
+    c))
+
+(defn- fresh-lock
+  "A new refcounted registry entry: an unlocked lock held by one acquirer."
+  []
+  {:ch (unlocked-chan) :n 1})
+
+(defn- acquire-entry
+  "Bump the refcount of `key`'s lock in registry map `m`, inserting `entry` when
+   absent. Pure."
+  [m key entry]
+  (if-let [e (clojure.core/get m key)]
+    (clojure.core/assoc m key (clojure.core/update e :n inc))
+    (clojure.core/assoc m key entry)))
+
+(defn- release-entry
+  "Drop one refcount for `key` in registry map `m`, removing the entry when the
+   last holder releases. Pure."
+  [m key]
+  (if-let [e (clojure.core/get m key)]
+    (if (<= (:n e) 1)
+      (clojure.core/dissoc m key)
+      (clojure.core/assoc m key (clojure.core/update e :n dec)))
+    m))
+
+;; Locking strategies — substitutable PLockRegistry records --------------------
+
+(defrecord RefcountedLockRegistry [locks]
+  ;; `locks`: atom of {key -> {:ch chan :n refcount}}. The refcount is bumped on
+  ;; acquire (before the caller parks) and dropped on release, so the entry
+  ;; survives every concurrent waiter and is reclaimed only at zero — bounding the
+  ;; registry instead of leaking one channel per distinct key for the store's life.
+  PLockRegistry
+  (-acquire-lock [_ key]
+    (:ch (clojure.core/get (swap! locks acquire-entry key (fresh-lock)) key)))
+  (-release-lock [_ key]
+    (swap! locks release-entry key)
+    nil))
+
+(defrecord LockFreeRegistry []
+  ;; MVCC backends (LMDB, …) serialize internally, so locks need not be tracked:
+  ;; hand out a throwaway unlocked channel and register nothing.
+  PLockRegistry
+  (-acquire-lock [_ _key] (unlocked-chan))
+  (-release-lock [_ _key] nil))
+
+(def ^:private lock-free-registry
+  "Stateless singleton shared by every lock-free store."
+  (->LockFreeRegistry))
+
+(defn- store-lock-registry
+  "Select `store`'s lock strategy (DIP: returns a PLockRegistry)."
+  [store]
   (if (lock-free? store)
-    ;; For lock-free stores, create a fresh unlocked channel
-    ;; This is used by operations that still need locking (assoc-in, update-in)
-    (let [c (chan)]
-      (put! c :unlocked)
-      c)
-    ;; Normal case: get or create persistent lock
-    (or (clojure.core/get @locks key)
-        (let [c (chan)]
-          (put! c :unlocked)
-          (clojure.core/get (swap! locks (fn [old]
-                                           (trace "creating lock for: " key)
-                                           (if (old key) old
-                                               (clojure.core/assoc old key c))))
-                            key)))))
+    lock-free-registry
+    (->RefcountedLockRegistry (:locks store))))
+
+;; Public API — single level of abstraction, delegate to the strategy ----------
+
+(defn get-lock
+  "Acquire `store`/`key`'s in-process lock channel, registering intent. MUST be
+   paired with `release-lock` so the entry is reclaimed when the last holder
+   releases — otherwise the registry grows one channel per distinct key for the
+   store's lifetime (unbounded heap retention). Lock-free stores get a throwaway
+   channel."
+  [store key]
+  (-acquire-lock (store-lock-registry store) key))
+
+(defn release-lock
+  "Release `store`/`key`'s in-process lock; reclaim the registry entry when no
+   holder remains. No-op for lock-free stores / unregistered keys. Paired with
+   `get-lock`."
+  [store key]
+  (-release-lock (store-lock-registry store) key))
 
 (defn wait [lock]
   #?(:clj (while (not (poll! lock))
             (Thread/sleep (long (rand-int 20))))
      :cljs (when-not (some-> lock poll!)
-             (debug "WARNING: konserve lock is not active. Only use the synchronous variant with the memory store in JavaScript."))))
+             (log/debug :konserve/lock-not-active "WARNING: konserve lock is not active. Only use the synchronous variant with the memory store in JavaScript."))))
 
 #_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
 (defmacro locked [store key & code]
-  `(let [l# (get-lock ~store ~key)]
+  `(let [s# ~store
+         k# ~key
+         l# (get-lock s# k#)]
      (try
        (wait l#)
-       (trace "acquired spin lock for " ~key)
+       (log/trace :konserve/acquired-spin-lock {:key k#})
        ~@code
        (finally
-         (trace "releasing spin lock for " ~key)
-         (put! l# :unlocked)))))
+         (log/trace :konserve/releasing-spin-lock {:key k#})
+         (put! l# :unlocked)
+         (release-lock s# k#)))))
 
 (defmacro go-locked [store key & code]
   `(go-try-
-    (let [l# (get-lock ~store ~key)]
+    (let [s# ~store
+          k# ~key
+          l# (get-lock s# k#)]
       (try
         (<?- l#)
-        (trace "acquired go-lock for: " ~key)
+        (log/trace :konserve/acquired-go-lock {:key k#})
         ~@code
         (finally
-          (trace "releasing go-lock for: " ~key)
-          (put! l# :unlocked))))))
+          (log/trace :konserve/releasing-go-lock {:key k#})
+          (put! l# :unlocked)
+          (release-lock s# k#))))))
 
 ;; Optional locking macros - skip locking for lock-free stores (MVCC backends)
 #_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
@@ -139,7 +225,7 @@
   ([store key]
    (exists? store key {:sync? false}))
   ([store key opts]
-   (trace "exists? on key " key)
+   (log/trace :konserve/exists? {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (maybe-go-locked
@@ -154,7 +240,7 @@
   ([store key-vec not-found]
    (get-in store key-vec not-found {:sync? false}))
   ([store key-vec not-found opts]
-   (trace "get-in on key " key-vec)
+   (log/trace :konserve/get-in {:key-vec key-vec})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (maybe-go-locked
@@ -179,7 +265,7 @@
   ([store key not-found]
    (get-meta store key not-found {:sync? false}))
   ([store key not-found opts]
-   (trace "get-meta on key " key)
+   (log/trace :konserve/get-meta {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (maybe-go-locked
@@ -192,16 +278,24 @@
 (defn update-in
   "Updates a position described by key-vec by applying up-fn and storing
   the result atomically. Returns a vector [old new] of the previous
-  value and the result of applying up-fn (the newly stored value)."
+  value and the result of applying up-fn (the newly stored value).
+
+  The optional `meta-up-fn` (5-arity, before the trailing `opts`) is
+  `(fn [built-meta] -> meta)`, transforming the value's default metadata — the general
+  metadata form (cf. `assoc`'s `meta` map). `opts` stays last."
   ([store key-vec up-fn]
-   (update-in store key-vec up-fn {:sync? false}))
+   (update-in store key-vec up-fn nil {:sync? false}))
   ([store key-vec up-fn opts]
-   (trace "update-in on key " key-vec)
+   (update-in store key-vec up-fn nil opts))
+  ([store key-vec up-fn meta-up-fn opts]
+   (log/trace :konserve/update-in {:key-vec key-vec})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (go-locked
                 store (first key-vec)
-                (let [[old-val new-val :as result] (<?- (-update-in store key-vec (partial meta-update (first key-vec) :edn) up-fn opts))]
+                (let [base (partial meta-update (first key-vec) :edn)
+                      mfn  (if meta-up-fn (fn [old] (meta-up-fn (base old))) base)
+                      [old-val new-val :as result] (<?- (-update-in store key-vec mfn up-fn opts))]
                   (invoke-write-hooks! store {:api-op :update-in
                                               :key (first key-vec)
                                               :key-vec key-vec
@@ -215,23 +309,35 @@
   the result atomically. Returns a vector [old new] of the previous
   value and the result of applying up-fn (the newly stored value)."
   ([store key fn]
-   (update store key fn {:sync? false}))
+   (update store key fn nil {:sync? false}))
   ([store key fn opts]
-   (trace "update on key " key)
-   (update-in store [key] fn opts)))
+   (update store key fn nil opts))
+  ([store key fn meta-up-fn opts]
+   (log/trace :konserve/update {:key key})
+   (update-in store [key] fn meta-up-fn opts)))
 
 (defn assoc-in
   "Associates the key-vec to the value, any missing collections for
-  the key-vec (nested maps and vectors) are newly created."
+  the key-vec (nested maps and vectors) are newly created.
+
+  The optional `meta-up-fn` (5-arity, before the trailing `opts`) is
+  `(fn [built-meta] -> meta)` — it TRANSFORMS the value's default metadata (the built
+  `{:key :type :last-write}`). This is the general form of `assoc`'s `meta` map (a map
+  is just the merge-transform), exposed here because nested writes may derive metadata
+  from the built fields. `opts` stays last and purely runtime."
   ([store key-vec val]
-   (assoc-in store key-vec val {:sync? false}))
+   (assoc-in store key-vec val nil {:sync? false}))
   ([store key-vec val opts]
-   (trace "assoc-in on key " key)
+   (assoc-in store key-vec val nil opts))
+  ([store key-vec val meta-up-fn opts]
+   (log/trace :konserve/assoc-in {:key-vec key-vec})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (go-locked
                 store (first key-vec)
-                (let [result (<?- (-assoc-in store key-vec (partial meta-update (first key-vec) :edn) val opts))]
+                (let [base   (partial meta-update (first key-vec) :edn)
+                      mfn    (if meta-up-fn (fn [old] (meta-up-fn (base old))) base)
+                      result (<?- (-assoc-in store key-vec mfn val opts))]
                   (invoke-write-hooks! store {:api-op :assoc-in
                                               :key (first key-vec)
                                               :key-vec key-vec
@@ -240,19 +346,30 @@
 
 (defn assoc
   "Associates the key to the value. This is a simple top-level overwrite
-   and does not require locking for MVCC stores. For nested paths, use assoc-in."
+   and does not require locking for MVCC stores. For nested paths, use assoc-in.
+
+   The optional `meta` MAP (5-arity, before the trailing `opts`) is merged into the
+   value's stored metadata — the built `{:key :type :last-write}` fields win on
+   conflict, so `meta` is additive. Use `{:immutable? true}` to mark a content-
+   addressed (write-once) value: it is recorded durably AND forwarded on the write-
+   hook event, so a consumer (konserve-sync) can skip re-storing a value it already
+   has. `opts` stays last and purely runtime."
   ([store key val]
-   (assoc store key val {:sync? false}))
+   (assoc store key val nil {:sync? false}))
   ([store key val opts]
-   (trace "assoc on key " key)
+   (assoc store key val nil opts))
+  ([store key val meta opts]
+   (log/trace :konserve/assoc {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (maybe-go-locked
                 store key
-                (let [result (<?- (-assoc-in store [key] (partial meta-update key :edn) val opts))]
-                  (invoke-write-hooks! store {:api-op :assoc
-                                              :key key
-                                              :value val})
+                (let [mfn    (if meta
+                               (fn [old] (clojure.core/merge meta (meta-update key :edn old)))
+                               (partial meta-update key :edn))
+                      result (<?- (-assoc-in store [key] mfn val opts))]
+                  (invoke-write-hooks! store (cond-> {:api-op :assoc :key key :value val}
+                                               meta (clojure.core/assoc :meta meta)))
                   result)))))
 
 (defn multi-get
@@ -275,7 +392,7 @@
   ([store keys]
    (multi-get store keys {:sync? false}))
   ([store keys opts]
-   (trace "multi-get operation with " (count keys) " keys")
+   (log/trace :konserve/multi-get {:key-count (count keys)})
    (when-not (multi-key-capable? store)
      (throw (#?(:clj ex-info :cljs js/Error.) "Store does not support multi-key operations"
                                               #?(:clj {:store-type (type store)
@@ -298,24 +415,69 @@
                          (throw e))
                        :cljs (throw e))))))))
 
-(defn multi-assoc
-  "Atomically associates multiple key-value pairs with flat keys.
-  Takes a map of keys to values and stores them in a single atomic transaction.
-  All operations must succeed or all must fail (all-or-nothing semantics).
+(defn uniform-meta
+  "Build a per-key meta map applying the same `meta` to every key — a convenience
+   for `multi-assoc`'s per-key `meta` when a whole batch shares one annotation:
+   `(multi-assoc store nodes (uniform-meta nodes {:immutable? true}) opts)`.
+   `kvs` may be a kv-map, an ordered seq of [k v] pairs, or a plain seq of keys.
+   Note the result is a plain lookup map — per-key meta is unordered by nature;
+   ordering lives in `kvs` (see `multi-assoc`)."
+  [kvs meta]
+  (let [ks (cond
+             (map? kvs)                      (clojure.core/keys kvs)
+             ;; seq of [k v] pairs (an ordered multi-assoc batch)
+             (and (sequential? (first kvs))
+                  (= 2 (count (first kvs))))  (clojure.core/map first kvs)
+             :else                            kvs)]
+    (zipmap ks (clojure.core/repeat meta))))
 
-  Example:
+(defn multi-assoc
+  "Associates multiple key-value pairs with flat keys, as one batch. Atomically where the
+  backend can (IndexedDB); ordered everywhere (see below), which is the weaker guarantee
+  that actually suffices.
+
+  `kvs` is either a map, or — preferred when the batch has internal dependencies — an
+  ORDERED sequence of `[k v]` pairs. **Sequence order is apply order**, and it is preserved
+  end-to-end: through the backing store's writes and verbatim onto the `:multi-assoc`
+  write-hook (so a sync layer can relay the batch in the same order). A map has no order,
+  so a map batch makes no ordering promise.
+
+  Why that matters: not every backend can write multiple keys atomically (S3, filesystems
+  cannot; IndexedDB can). For a batch that writes a set of immutable, content-addressed
+  values plus a MUTABLE pointer that makes them reachable, you do not need atomicity — you
+  need order. Put the pointer LAST:
+
   ```
-  (multi-assoc store {:user1 {:name \"Alice\"}
-                      :user2 {:name \"Bob\"}})
+  (multi-assoc store [[node-a v] [node-b v] [:root {:refs [node-a node-b]}]]
+               (uniform-meta [node-a node-b] {:immutable? true}))
   ```
+
+  Then any prefix of the batch leaves the store consistent: the values are written but
+  unreachable (harmless orphans, collectable), and the pointer flips only once everything it
+  references exists. A torn batch can never produce a dangling pointer. This is the
+  write-the-leaves-then-flip-the-root discipline, and it is what lets non-atomic backends be
+  crash-safe.
+
+  Atomic backends still apply the batch all-or-nothing, in which case the order is simply
+  redundant — passing an ordered seq is always safe.
 
   Returns a map of keys to results (typically true for each key).
 
+  The optional `meta` (4-arity, before the trailing `opts`) is a PER-KEY map
+  `{key -> meta-map}`, pure data so the whole map is forwarded verbatim on the write-hook
+  (a consumer like konserve-sync can relay/serialize it). Each written value's metadata is
+  merged with `(get meta key)` (built `{:key :type :last-write}` fields win). Keys absent
+  from `meta` get no extra metadata, so one atomic batch can mark some keys immutable
+  (content-addressed nodes) and leave others (a mutable branch-head pointer) unmarked. Use
+  `uniform-meta` for the all-keys-same case.
+
   Throws an exception if the store doesn't support multi-key operations."
   ([store kvs]
-   (multi-assoc store kvs {:sync? false}))
+   (multi-assoc store kvs nil {:sync? false}))
   ([store kvs opts]
-   (trace "multi-assoc operation with " (count kvs) " keys")
+   (multi-assoc store kvs nil opts))
+  ([store kvs meta opts]
+   (log/trace :konserve/multi-assoc {:key-count (count kvs)})
    (when-not (multi-key-capable? store)
      (throw (#?(:clj ex-info :cljs js/Error.) "Store does not support multi-key operations"
                                               #?(:clj {:store-type (type store)
@@ -323,8 +485,12 @@
    (async+sync (:sync? opts)
                *default-sync-translation*
                (go-try-
-                (let [result (try
-                               (<?- (-multi-assoc store kvs meta-update opts))
+                (let [mfn    (if meta
+                               ;; per-key meta map: `(get meta key)` (nil ⇒ just the built meta)
+                               (fn [key type old] (clojure.core/merge (clojure.core/get meta key) (meta-update key type old)))
+                               meta-update)
+                      result (try
+                               (<?- (-multi-assoc store kvs mfn opts))
                                (catch #?(:clj Exception :cljs js/Error) e
                                  ;; Backend might throw an exception indicating it doesn't support multi-key operations
                                  ;; even though the store implements the protocol
@@ -337,8 +503,9 @@
                                                        :reason (:reason (ex-data e))}))
                                       (throw e))
                                     :cljs (throw e))))]
-                  (invoke-write-hooks! store {:api-op :multi-assoc
-                                              :kvs kvs})
+                  (invoke-write-hooks! store (cond-> {:api-op :multi-assoc :kvs kvs}
+                                               ;; per-key meta map forwarded verbatim (pure data)
+                                               meta (clojure.core/assoc :meta meta)))
                   result)))))
 
 (defn dissoc
@@ -346,7 +513,7 @@
   ([store key]
    (dissoc store key {:sync? false}))
   ([store key opts]
-   (trace "dissoc on key " key)
+   (log/trace :konserve/dissoc {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (maybe-go-locked
@@ -373,7 +540,7 @@
   ([store keys]
    (multi-dissoc store keys {:sync? false}))
   ([store keys opts]
-   (trace "multi-dissoc operation with " (count keys) " keys")
+   (log/trace :konserve/multi-dissoc {:key-count (count keys)})
    (when-not (multi-key-capable? store)
      (throw (#?(:clj ex-info :cljs js/Error.) "Store does not support multi-key operations"
                                               #?(:clj {:store-type (type store)
@@ -402,7 +569,7 @@
   ([store key elem]
    (append store key elem {:sync? false}))
   ([store key elem opts]
-   (trace "append on key " key)
+   (log/trace :konserve/append {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (go-locked
@@ -425,7 +592,7 @@
   ([store key]
    (log store key {:sync? false}))
   ([store key opts]
-   (trace "log on key " key)
+   (log/trace :konserve/log {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (go-try-
@@ -446,7 +613,7 @@
   ([store key reduce-fn acc]
    (reduce-log store key reduce-fn acc {:sync? false}))
   ([store key reduce-fn acc opts]
-   (trace "reduce-log on key " key)
+   (log/trace :konserve/reduce-log {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (go-try-
@@ -480,7 +647,7 @@
   ([store key locked-cb]
    (bget store key locked-cb {:sync? false}))
   ([store key locked-cb opts]
-   (trace "bget on key " key)
+   (log/trace :konserve/bget {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (maybe-go-locked
@@ -493,7 +660,7 @@
   ([store key val]
    (bassoc store key val {:sync? false}))
   ([store key val opts]
-   (trace "bassoc on key " key)
+   (log/trace :konserve/bassoc {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (maybe-go-locked
@@ -509,7 +676,7 @@
   ([store]
    (keys store {:sync? false}))
   ([store opts]
-   (trace "fetching keys")
+   (log/trace :konserve/keys "fetching keys")
    (-keys store opts)))
 
 (defn assoc-serializers
