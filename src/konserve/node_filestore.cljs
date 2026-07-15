@@ -370,14 +370,15 @@
   [^string base]
   (let [f             (io/file base)
         parent-base (.getParent f)]
-    (doseq [c (.list (io/file base))]
-      (.delete (io/file (path.join base c))))
-    (.delete f)
-    (try
-      (sync-base parent-base)
-      nil
-      (catch js/Error e
-        e))))
+    (when (.exists f)
+      (doseq [c (.list f)]
+        (.delete (io/file (path.join base c))))
+      (.delete f)
+      (try
+        (sync-base parent-base)
+        nil
+        (catch js/Error e
+          e)))))
 
 ;;==============================================================================
 ;;  async backing impl
@@ -467,19 +468,27 @@
       removing a child). Opening the deleted dir failed, and `sync-base-async` then
       called `.force` on the resulting Error.
    3. Even on the intended path it piped `sync-base-async`'s value straight through
-      instead of normalising to nil like the sync twin does."
+      instead of normalising to nil like the sync twin does.
+   4. Node reports an absent directory as `ENOENT`. Deleting an already absent store is
+      successful and must not turn idempotent lifecycle cleanup into an error."
   [^string base]
   (let [parent-base (.getParent (io/file base))]
     (with-promise out
       (take! (iofs/arm-r base)
              (fn [[?err]]
-               (if (some? ?err)
-                 (put! out ?err)
+               (cond
+                 (nil? ?err)
                  (take! (sync-base-async parent-base)
                         (fn [?sync-err]
                           (if (some? ?sync-err)
                             (put! out ?sync-err)
-                            (close! out))))))))))
+                            (close! out))))
+
+                 (= "ENOENT" (.-code ?err))
+                 (close! out)
+
+                 :else
+                 (put! out ?err)))))))
 
 ;;==============================================================================
 

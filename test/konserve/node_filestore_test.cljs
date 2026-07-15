@@ -21,6 +21,15 @@
 (use-fixtures :each {:before #(do (fs/rm-rf store-path)
                                   (fs/rm-rf tiered-store-path))})
 
+(deftest delete-absent-store-test
+  (is (nil? (filestore/delete-store (str store-path "/nested")))
+      "synchronously deleting a store with an absent parent is idempotent")
+  (async done
+         (go
+           (is (nil? (<! (filestore/delete-store-async store-path)))
+               "asynchronously deleting an absent store is idempotent")
+           (done))))
+
 (deftest PEDNKeyValueStore-sync-test
   (let [opts {:sync? true}
         store (connect-fs-store store-path :opts opts)]
