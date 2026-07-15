@@ -26,6 +26,14 @@
         (sl/parse-header header ser/key->serializer)]
     parsed-meta-size))
 
+(defn- legacy-one-byte-header [meta-size]
+  (let [header (sl/create-header sl/default-version
+                                 (ser/fressian-serializer)
+                                 null-compressor null-encryptor 0)]
+    #?(:clj (aset-byte ^bytes header 4 (unchecked-byte meta-size))
+       :cljs (aset header 4 meta-size))
+    header))
+
 (deftest header-meta-size-byte-layout
   (testing "meta-size occupies bytes 4-7 as a big-endian int (canonical JVM/doc layout)"
     ;; 300 = 0x0000012C  -> bytes 4..7 = [0 0 1 44]
@@ -46,14 +54,16 @@
     (doseq [ms [0 1 44 200 255 256 300 1000 70000 1000000 16777215 16777217 16777300]]
       (is (= ms (roundtrip-meta-size ms)) (str "meta-size " ms)))))
 
-#?(:cljs
-   (deftest header-legacy-cljs-single-byte-read
-     (testing "parse-header still reads a LEGACY cljs single-byte meta-size (byte 4, bytes 5-7 = 0)"
-       ;; Simulate a header written by the old cljs writer: canonical bytes 0-3, then the
-       ;; meta-size as a single byte at offset 4, bytes 5-19 left zero (Uint8Array zero-init).
-       (doseq [ms [1 44 200 255]]
-         (let [legacy (js/Uint8Array. (sl/create-header sl/default-version (ser/fressian-serializer)
-                                                        null-compressor null-encryptor 0))]
-           (aset legacy 4 ms) (aset legacy 5 0) (aset legacy 6 0) (aset legacy 7 0)
-           (let [[_ _ _ _ parsed _] (sl/parse-header legacy ser/key->serializer)]
-             (is (= ms parsed) (str "legacy single-byte meta-size " ms))))))))
+(deftest header-legacy-cljs-single-byte-read
+  (testing "both runtimes read legacy CLJS one-byte metadata sizes"
+    (doseq [ms [1 44 200 255]]
+      (let [[_ _ _ _ parsed _]
+            (sl/parse-header (legacy-one-byte-header ms) ser/key->serializer)]
+        (is (= ms parsed) (str "legacy single-byte meta-size " ms))))))
+
+(deftest header-meta-size-sniff-boundaries
+  (testing "the legacy sniff does not consume ordinary BE32 sizes"
+    (is (= 32 (roundtrip-meta-size 32)))
+    (is (= 300 (roundtrip-meta-size 300)))
+    (is (= 70000 (roundtrip-meta-size 70000)))
+    (is (= 16777217 (roundtrip-meta-size 16777217)))))

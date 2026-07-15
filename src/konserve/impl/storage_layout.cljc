@@ -62,6 +62,27 @@
       (not= 0 (aget bs 18))
       (not= 0 (aget bs 19))))
 
+(defn read-meta-size
+  "Read the four-byte metadata size or its legacy CLJS encoding."
+  [header-bytes]
+  (let [byte-at #?(:clj (fn [i]
+                          (bit-and (aget ^bytes header-bytes (int i)) 0xff))
+                   :cljs (fn [i]
+                           (aget header-bytes i)))
+        b4 (byte-at 4)
+        b5 (byte-at 5)
+        b6 (byte-at 6)
+        b7 (byte-at 7)]
+    ;; Before the BE32 fix CLJS wrote the size only at byte 4. Interpreted as
+    ;; BE32 that pattern is at least 16 MiB, larger than a Konserve metadata
+    ;; section in practice, so reserve it for the historical encoding.
+    (if (and (not (zero? b4))
+             (zero? b5)
+             (zero? b6)
+             (zero? b7))
+      b4
+      (+ (* b4 16777216) (* b5 65536) (* b6 256) b7))))
+
 (defn parse-header
   "Inverse function to create-header. serializers are a map of serializer-id to
   instance that are potentially initialized with custom handlers by the store
@@ -79,7 +100,7 @@
            serializer-id (.get bb 1)
            compressor-id (.get bb 2)
            encryptor-id (.get bb 3)
-           meta-size (.getInt bb 4)
+           meta-size (read-meta-size header-bytes)
            ;; was used temporarily at some point during 0.6.0-alpha (JVM only)
            small-header-size 8
            actual-header-size (if (and (= version 1)
@@ -121,17 +142,7 @@
            serializer-id (aget header-bytes 1)
            compressor-id (aget header-bytes 2)
            encryptor-id (aget header-bytes 3)
-           ;; Meta-size is a 4-byte big-endian int at bytes 4-7 (matches the JVM `.getInt`;
-           ;; `*`/`+` instead of bit-ops to avoid JS 32-bit-signed overflow for large sizes).
-           ;; Back-compat: a legacy cljs writer stored meta-size as a SINGLE byte at offset 4
-           ;; (bytes 5-7 = 0), capped at 255. Read those transparently so existing cljs stores
-           ;; still load: a nonzero byte 4 with all lower bytes zero can only be the legacy
-           ;; single-byte size (a real 4-byte meta-size >= 16 MB is never a metadata blob).
-           b4 (aget header-bytes 4) b5 (aget header-bytes 5)
-           b6 (aget header-bytes 6) b7 (aget header-bytes 7)
-           meta-size (if (and (not= b4 0) (== b5 0) (== b6 0) (== b7 0))
-                       b4
-                       (+ (* b4 16777216) (* b5 65536) (* b6 256) b7))
+           meta-size (read-meta-size header-bytes)
            serializer (serializers (byte->key serializer-id))
            compressor (byte->compressor compressor-id)
            encryptor (byte->encryptor encryptor-id)]
