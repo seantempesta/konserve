@@ -12,27 +12,30 @@
   (-dissoc [this key opts]))
 
 (defprotocol PMultiKeySupport
-  "Protocol for checking if a store supports atomic multi-key operations."
+  "Protocol for checking if a store supports multi-key operations."
   (-supports-multi-key? [this]
-    "Returns true if the store supports atomic multi-key operations."))
+    "Returns true if the store supports multi-key operations."))
 
 (defprotocol PMultiKeyEDNValueStore
-  "Allows to atomically update multiple key-value pairs with all-or-nothing semantics.
-   This is an optional protocol that backends can implement to provide transactional operations."
+  "Provides optional multi-key operations with backend-specific atomicity.
+
+   Multi-assoc always preserves an ordered pair sequence. Backends such as
+   IndexedDB may additionally provide all-or-nothing transactions; filesystems
+   provide durable ordered-prefix semantics instead."
   (-multi-get [this keys opts]
-    "Atomically retrieves multiple values by keys.
+    "Retrieves multiple values by keys.
      Takes a collection of keys and returns a sparse map containing only found keys.
      Uses flat keys only (not key-vecs).
      Returns a map {key -> value} for all found keys. Missing keys are excluded from result.")
   (-multi-assoc [this kvs meta-up-fn opts]
-    "Atomically associates multiple key-value pairs with flat keys.
-     Takes a map of keys to values and stores them in a single atomic transaction.
-     All operations must succeed or all must fail (all-or-nothing semantics).
+    "Associates multiple key-value pairs with flat keys.
+     An ordered sequence of [key value] pairs is applied in sequence order. A map
+     carries no ordering promise. Atomic backends may strengthen this to all-or-nothing.
      Returns a map of keys to results (typically true for each key).")
   (-multi-dissoc [this kvs opts]
-    "Atomically dissociates multiple keys with flat keys.
-     Takes a collection of keys to remove and deletes them in a single atomic transaction.
-     All operations must succeed or all must fail (all-or-nothing semantics).
+    "Dissociates multiple keys with flat keys.
+     Takes a collection of keys to remove in one backend operation.
+     Atomic backends may strengthen this to all-or-nothing.
      Returns a map of keys to results (typically true for each key)."))
 
 (defprotocol PBinaryKeyValueStore
@@ -84,4 +87,3 @@
 (extend-protocol PLockFreeStore
   #?(:clj Object :cljs default)
   (-lock-free? [_] false))
-

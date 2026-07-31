@@ -7,7 +7,12 @@
    [konserve.encryptor :refer [null-encryptor]]
    [konserve.impl.defaults :refer [update-blob connect-default-store key->store-key store-key->uuid-key]]
    [konserve.impl.storage-layout :refer [PBackingStore
-                                         PBackingBlob -close
+                                         -create-blob -delete-blob -blob-exists?
+                                         -atomic-move -sync-store
+                                         PBackingBlob -close -sync
+                                         -write-header -write-meta -write-value
+                                         PMultiWriteBackingStore
+                                         PMultiReadBackingStore
                                          PBackingLock header-size]]
    [konserve.nio-helpers :refer [blob->channel]]
    [konserve.protocols :as kp]
@@ -18,7 +23,7 @@
    [java.io ByteArrayInputStream FileInputStream Closeable]
    [java.nio.channels FileChannel AsynchronousFileChannel CompletionHandler FileLock]
    [java.nio ByteBuffer]
-   [java.nio.file Files StandardCopyOption FileSystem FileSystems Path Paths OpenOption LinkOption StandardOpenOption]
+   [java.nio.file Files NoSuchFileException StandardCopyOption FileSystem FileSystems Path Paths OpenOption LinkOption StandardOpenOption]
    [java.util Date UUID]))
 
 ;; =============================================================================
@@ -36,6 +41,26 @@
   (merge *default-sync-translation*
          '{AsynchronousFileChannel FileChannel}))
 
+(def ^:dynamic *multi-write-stage-hook*
+  "Receives deterministic filestore batch stages for crash testing."
+  (constantly nil))
+
+(defn- publish-multi-write-stage!
+  [stage]
+  (*multi-write-stage-hook* {::stage stage}))
+
+(defn- staging-store-key
+  [store-key]
+  (str store-key "." (UUID/randomUUID) ".new"))
+
+(defn- open-existing-blob
+  [filesystem base store-key sync?]
+  (let [path (get-path filesystem base store-key)
+        options (into-array StandardOpenOption [StandardOpenOption/READ])]
+    (if sync?
+      (FileChannel/open path options)
+      (AsynchronousFileChannel/open path options))))
+
 (defn- sync-base
   "Helper Function to synchronize the base of the filestore.
    Note: Jimfs doesn't support directory sync via FileChannel, so we skip it."
@@ -47,6 +72,86 @@
            fc (FileChannel/open p (into-array OpenOption []))]
        (.force fc true)
        (.close fc)))))
+
+(defn- cleanup-staged-blobs!
+  [backing staged env]
+  (async+sync
+   (:sync? env) *sync-translation*
+   (go-try-
+    (doseq [{:keys [blob new-store-key]} staged]
+      (when blob
+        (try (<?- (-close blob env)) (catch Exception _)))
+      (try
+        (when (<?- (-blob-exists? backing new-store-key env))
+          (<?- (-delete-blob backing new-store-key env)))
+        (catch Exception _)))
+    nil)))
+
+(defn- stage-blob
+  [backing [store-key {:keys [header meta value]}] env]
+  (async+sync
+   (:sync? env) *sync-translation*
+   (go-try-
+    (let [new-store-key (staging-store-key store-key)]
+      (try
+        (let [blob (<?- (-create-blob backing new-store-key env))]
+          (try
+            (<?- (-write-header blob header env))
+            (<?- (-write-meta blob meta env))
+            (<?- (-write-value blob value (alength ^bytes meta) env))
+            (when (get-in env [:config :sync-blob?])
+              (log/trace :konserve/syncing-batch-blob {:store-key store-key})
+              (<?- (-sync blob env))
+              (*multi-write-stage-hook* {::stage :blob-forced
+                                         ::store-key store-key}))
+            (<?- (-close blob env))
+            {:store-key store-key
+             :new-store-key new-store-key
+             :blob nil}
+            (catch Exception error
+              (<?- (-close blob env))
+              (throw error))))
+        (catch Exception error
+          (try
+            (when (<?- (-blob-exists? backing new-store-key env))
+              (<?- (-delete-blob backing new-store-key env)))
+            (catch Exception _))
+          (throw error)))))))
+
+(defn- write-blobs-in-order!
+  [backing store-key-values env]
+  (async+sync
+   (:sync? env) *sync-translation*
+   (go-try-
+    (loop [index 0
+           pending (seq store-key-values)
+           result {}]
+      (if-let [store-key-value (first pending)]
+        (let [next-pending (next pending)
+              last? (nil? next-pending)
+              {:keys [store-key new-store-key] :as staged}
+              (<?- (stage-blob backing store-key-value env))]
+          (try
+            (when (zero? index)
+              (publish-multi-write-stage! :staged))
+            (when last?
+              (publish-multi-write-stage! :before-last-move))
+            (<?- (-atomic-move backing new-store-key store-key env))
+            (*multi-write-stage-hook* {::stage :blob-moved
+                                       ::store-key store-key})
+            (when (zero? index)
+              (publish-multi-write-stage! :after-first-move))
+            (when last?
+              (publish-multi-write-stage! :after-last-move))
+            (when (get-in env [:config :sync-blob?])
+              (<?- (-sync-store backing env))
+              (*multi-write-stage-hook* {::stage :directory-forced
+                                         ::store-key store-key}))
+            (catch Exception error
+              (<?- (cleanup-staged-blobs! backing [staged] env))
+              (throw error)))
+          (recur (inc index) next-pending (assoc result store-key true)))
+        result)))))
 
 (defn- check-and-create-backing-store
   "Helper Function to Check if Base is not writable"
@@ -214,7 +319,55 @@
   (-sync-store [_this env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
-                 (sync-base filesystem base)))))
+                 (sync-base filesystem base))))
+
+  PMultiWriteBackingStore
+  (-multi-write-blobs [this store-key-values env]
+    ;; Retain the single-key fallback's force and ordered rename barriers
+    ;; exactly while accepting the caller's batch as one protocol operation.
+    (write-blobs-in-order! this store-key-values env))
+
+  (-multi-delete-blobs [this store-keys env]
+    (async+sync
+     (:sync? env) *sync-translation*
+     (go-try-
+      (let [result
+            (loop [result {}
+                   pending (seq store-keys)]
+              (if-let [store-key (first pending)]
+                (let [existed? (<?- (-blob-exists? this store-key env))]
+                  (when existed?
+                    (<?- (-delete-blob this store-key env))
+                    (when (get-in env [:config :sync-blob?])
+                      (<?- (-sync-store this env))))
+                  (recur (assoc result store-key existed?) (next pending)))
+                result))]
+        result))))
+
+  PMultiReadBackingStore
+  (-multi-read-blobs [_this store-keys env]
+    (async+sync
+     (:sync? env) *sync-translation*
+     (go-try-
+      (loop [result {}
+             pending (seq store-keys)]
+        (if-let [store-key (first pending)]
+          (let [attempt (try
+                          {:blob (open-existing-blob filesystem base store-key (:sync? env))}
+                          (catch NoSuchFileException _
+                            {:missing? true})
+                          (catch Exception error
+                            {:error error}))]
+            (if-let [error (:error attempt)]
+              (do
+                (doseq [blob (vals result)]
+                  (<?- (-close blob env)))
+                (throw error))
+              (recur (if-let [blob (:blob attempt)]
+                       (assoc result store-key blob)
+                       result)
+                     (next pending))))
+          result))))))
 
 (extend-type AsynchronousFileChannel
   PBackingBlob

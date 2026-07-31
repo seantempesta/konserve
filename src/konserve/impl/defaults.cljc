@@ -684,7 +684,7 @@
        (go-try-
         ;; Convert keys to store-keys
         (let [store-keys (map key->store-key keys)
-              env (merge opts {:sync? sync?})
+              env (merge opts {:sync? sync? :config config})
 
               ;; Use backing store's multi-delete capability
               result (<?- (-multi-delete-blobs backing store-keys env))]
@@ -706,27 +706,34 @@
        sync? *default-sync-translation*
        (go-try-
         ;; Convert keys to store-keys and track the mapping
-        (let [keys-and-store-keys (map (fn [k] [k (key->store-key k)]) keys)
+        (let [keys-and-store-keys (into []
+                                        (comp (map (fn [k] [k (key->store-key k)]))
+                                              (distinct))
+                                        keys)
               store-keys (map second keys-and-store-keys)
-              env (merge opts {:sync? sync?})
+              env (merge opts {:sync? sync? :config config})
 
               ;; Use backing store's multi-read capability to get blobs
               store-key-to-blob (<?- (-multi-read-blobs backing store-keys env))]
 
-          ;; Deserialize each blob and build result map (sparse - only found keys)
-          (loop [result {}
-                 pending keys-and-store-keys]
-            (if-let [[key store-key] (first pending)]
-              (if-let [blob (get store-key-to-blob store-key)]
-                ;; Blob exists, deserialize it
-                (let [read-env (assoc env :store-key store-key
-                                      :operation :read-edn
-                                      :config config)
-                      value (<?- (read-blob blob read-handlers serializers read-env))]
-                  (recur (assoc result key value) (rest pending)))
-                ;; Blob doesn't exist, skip this key (sparse map)
-                (recur result (rest pending)))
-              result)))))))
+          ;; Deserialize each blob and build result map (sparse - only found keys).
+          ;; Some backings return open resources for the complete read set, so one
+          ;; outer finally owns every blob even when deserialization fails midway.
+          (try
+            (loop [result {}
+                   pending keys-and-store-keys]
+              (if-let [[key store-key] (first pending)]
+                (if-let [blob (get store-key-to-blob store-key)]
+                  (let [read-env (assoc env :store-key store-key
+                                        :operation :read-edn
+                                        :config config)
+                        value (<?- (read-blob blob read-handlers serializers read-env))]
+                    (recur (assoc result key value) (rest pending)))
+                  (recur result (rest pending)))
+                result))
+            (finally
+              (doseq [blob (vals store-key-to-blob)]
+                (<?- (-close blob env))))))))))
 
   PWriteHookStore
   (-get-write-hooks [_] write-hooks)
