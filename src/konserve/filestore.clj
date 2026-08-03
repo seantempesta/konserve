@@ -21,8 +21,8 @@
    [superv.async :refer [go-try- <?-]]
    [replikativ.logging :as log])
   (:import
-   [java.io ByteArrayInputStream FileInputStream FilterInputStream Closeable]
-   [java.nio.channels Channels FileChannel AsynchronousFileChannel CompletionHandler FileLock]
+   [java.io ByteArrayInputStream FileInputStream Closeable]
+   [java.nio.channels FileChannel AsynchronousFileChannel CompletionHandler FileLock]
    [java.nio ByteBuffer]
    [java.nio.file Files NoSuchFileException StandardCopyOption FileSystem FileSystems Path Paths OpenOption LinkOption StandardOpenOption]
    [java.util Date UUID]))
@@ -627,16 +627,14 @@
       (.array buffer)))
   (-read-binary [this meta-size locked-cb env]
     (let [{:keys [header-size]} env
-          payload-start (+ header-size meta-size)
-          payload-size (- (.size this) payload-start)
-          _ (.position this payload-start)
-          input (proxy [FilterInputStream]
-                       [(Channels/newInputStream this)]
-                  (close [] nil))]
-      ;; `io-operation` owns and closes `this` after the locked callback.
-      ;; The callback may close its view without closing the locked channel.
-      (locked-cb {:input-stream input
-                  :size payload-size}))))
+          total-size (.size this)]
+      (locked-cb {:input-stream (ByteArrayInputStream.
+                                 (let [buffer (ByteBuffer/allocate (- total-size
+                                                                      meta-size
+                                                                      header-size))]
+                                   (.read this buffer (+ header-size meta-size))
+                                   (.array buffer)))
+                  :size total-size}))))
 
 (extend-type FileLock
   PBackingLock

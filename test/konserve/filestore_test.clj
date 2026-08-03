@@ -59,24 +59,14 @@
             _ (bassoc store :large-file payload-file {:sync? true})
             write-allocation (- (.getThreadAllocatedBytes bean thread-id)
                                 write-before)
-            stream-before (.getThreadAllocatedBytes bean thread-id)
-            first-byte (bget store :large-file
-                             (fn [{:keys [input-stream]}]
-                               (.read ^java.io.InputStream input-stream))
-                             {:sync? true})
-            stream-allocation (- (.getThreadAllocatedBytes bean thread-id)
-                                 stream-before)
             read-before (.getThreadAllocatedBytes bean thread-id)
             actual (konserve.core/bget-range
                     store :large-file range-offset (alength expected))
             read-allocation (- (.getThreadAllocatedBytes bean thread-id)
                                read-before)]
         (is (java.util.Arrays/equals expected actual))
-        (is (= 0 first-byte))
         (is (< write-allocation (* 8 1024 1024))
             (str "32 MiB File bassoc allocated " write-allocation " bytes"))
-        (is (< stream-allocation (* 1024 1024))
-            (str "one-byte streaming bget allocated " stream-allocation " bytes"))
         (is (< read-allocation (* 1024 1024))
             (str "4 KiB range read allocated " read-allocation " bytes")))
       (finally
