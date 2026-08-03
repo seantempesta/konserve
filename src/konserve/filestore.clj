@@ -13,7 +13,8 @@
                                          -write-header -write-meta -write-value
                                          PMultiWriteBackingStore
                                          PMultiReadBackingStore
-                                         PBackingLock header-size]]
+                                         PBackingBinaryRangeStore
+                                         PBackingLock header-size parse-header]]
    [konserve.nio-helpers :refer [blob->channel]]
    [konserve.protocols :as kp]
    [konserve.utils :refer [async+sync *default-sync-translation*]]
@@ -238,7 +239,8 @@
        (do (log/trace :konserve/store-not-found {:base (str base)})
            false)))))
 
-(declare migrate-old-files migrate-file-v2 migrate-file-v1)
+(declare migrate-old-files migrate-file-v2 migrate-file-v1
+         read-binary-range*)
 
 (defrecord BackingFilestore [base detected-old-blobs ephemeral? filesystem]
   PBackingStore
@@ -321,6 +323,10 @@
                 (go-try-
                  (sync-base filesystem base))))
 
+  PBackingBinaryRangeStore
+  (-read-binary-range [this store-key serializers offset length _env]
+    (read-binary-range* this store-key serializers offset length))
+
   PMultiWriteBackingStore
   (-multi-write-blobs [this store-key-values env]
     ;; Retain the single-key fallback's force and ordered rename barriers
@@ -368,6 +374,56 @@
                        result)
                      (next pending))))
           result))))))
+
+(defn- read-buffer-at!
+  [^FileChannel channel ^ByteBuffer buffer position]
+  (loop [position (long position)
+         total 0]
+    (if (.hasRemaining buffer)
+      (let [read-count (.read channel buffer position)]
+        (cond
+          (neg? read-count) total
+          (zero? read-count)
+          (throw (ex-info "File channel made no progress while reading."
+                          {:position position
+                           :remaining (.remaining buffer)}))
+          :else
+          (recur (+ position read-count) (+ total read-count))))
+      total)))
+
+(defn- read-binary-range*
+  [backing store-key serializers offset length]
+  (when (neg? offset)
+    (throw (ex-info "Binary range offset must be non-negative."
+                    {:offset offset})))
+  (when (or (neg? length) (> length Integer/MAX_VALUE))
+    (throw (ex-info "Binary range length is outside the byte-array limit."
+                    {:length length})))
+  (let [{:keys [base filesystem]} backing]
+    (try
+      (with-open [channel ^FileChannel
+                  (open-existing-blob filesystem base store-key true)]
+        (let [header-buffer (ByteBuffer/allocate header-size)
+              header-read (read-buffer-at! channel header-buffer 0)]
+          (when (< header-read 8)
+            (throw (ex-info "Stored binary has an incomplete header."
+                            {:store-key store-key
+                             :header-bytes header-read})))
+          (let [[_ _ _ _ meta-size actual-header-size]
+                (parse-header (.array header-buffer) serializers)
+                payload-start (+ actual-header-size meta-size)
+                payload-size (max 0 (- (.size channel) payload-start))
+                readable (max 0 (- payload-size offset))
+                read-size (int (min (long length) readable))
+                range-buffer (ByteBuffer/allocate read-size)
+                actual-size (read-buffer-at!
+                             channel range-buffer (+ payload-start offset))
+                range-bytes (.array range-buffer)]
+            (if (= actual-size read-size)
+              range-bytes
+              (java.util.Arrays/copyOf ^bytes range-bytes actual-size)))))
+      (catch NoSuchFileException _
+        nil))))
 
 (extend-type AsynchronousFileChannel
   PBackingBlob

@@ -186,6 +186,11 @@
   (-keys [this env] "List all the keys representing blobs in the store.")
   (-handle-foreign-key [this migration-key serializer read-handlers write-handlers env] "Handle keys not recognized by the current konserve version."))
 
+(defprotocol PBackingBinaryRangeStore
+  "Optional bounded binary reads implemented by range-capable backings."
+  (-read-binary-range [this store-key serializers offset length env]
+    "Returns at most length payload bytes from offset without a full read."))
+
 (defprotocol PMultiWriteBackingStore
   "Protocol for backing stores that support multi-key writes."
   (-multi-write-blobs [this store-key-values env]

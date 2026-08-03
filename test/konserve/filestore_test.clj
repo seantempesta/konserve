@@ -1,6 +1,7 @@
 (ns konserve.filestore-test
   (:refer-clojure :exclude [get get-in update update-in assoc assoc-in dissoc exists? keys])
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
             [clojure.core.async :refer [<!! go chan put! close! <!] :as async]
             [konserve.core :refer [bassoc bget keys]]
             [konserve.compliance-test :refer [compliance-test]]
@@ -12,6 +13,66 @@
             [konserve.tests.tiered :as tiered-tests]
             [konserve.memory :as memory]
             [konserve.tiered :as tiered]))
+
+(deftest binary-file-input-streams-without-materializing-the-source
+  (let [root (str "target/konserve-binary-file-test/" (random-uuid))
+        store-path (str root "/store")
+        payload-file (io/file root "payload.bin")
+        payload (byte-array [0 -1 -128 127 42])]
+    (try
+      (.mkdirs (.getParentFile payload-file))
+      (with-open [output (io/output-stream payload-file)]
+        (.write output payload))
+      (let [store (connect-fs-store store-path :opts {:sync? true})]
+        (is (true? (bassoc store :file payload-file {:sync? true})))
+        (is (java.util.Arrays/equals
+             payload
+             (bget store :file
+                   (fn [{:keys [input-stream]}]
+                     (.readAllBytes ^java.io.InputStream input-stream))
+                   {:sync? true}))))
+      (finally
+        (delete-store store-path)
+        (io/delete-file payload-file true)
+        (io/delete-file (io/file root) true)))))
+
+(deftest file-binary-range-work-is-proportional-to-the-request
+  (let [root (str "target/konserve-binary-range-test/" (random-uuid))
+        store-path (str root "/store")
+        payload-file (io/file root "payload.bin")
+        payload-size (* 32 1024 1024)
+        range-offset (+ 1024 1024 3)
+        expected (byte-array (map #(unchecked-byte (mod % 256))
+                                  (range 4096)))
+        bean ^com.sun.management.ThreadMXBean
+        (java.lang.management.ManagementFactory/getThreadMXBean)
+        thread-id (.getId (Thread/currentThread))]
+    (try
+      (.mkdirs (.getParentFile payload-file))
+      (with-open [payload (java.io.RandomAccessFile. payload-file "rw")]
+        (.setLength payload payload-size)
+        (.seek payload range-offset)
+        (.write payload expected))
+      (.setThreadAllocatedMemoryEnabled bean true)
+      (let [store (connect-fs-store store-path :opts {:sync? true})
+            write-before (.getThreadAllocatedBytes bean thread-id)
+            _ (bassoc store :large-file payload-file {:sync? true})
+            write-allocation (- (.getThreadAllocatedBytes bean thread-id)
+                                write-before)
+            read-before (.getThreadAllocatedBytes bean thread-id)
+            actual (konserve.core/bget-range
+                    store :large-file range-offset (alength expected))
+            read-allocation (- (.getThreadAllocatedBytes bean thread-id)
+                               read-before)]
+        (is (java.util.Arrays/equals expected actual))
+        (is (< write-allocation (* 8 1024 1024))
+            (str "32 MiB File bassoc allocated " write-allocation " bytes"))
+        (is (< read-allocation (* 1024 1024))
+            (str "4 KiB range read allocated " read-allocation " bytes")))
+      (finally
+        (delete-store store-path)
+        (io/delete-file payload-file true)
+        (io/delete-file (io/file root) true)))))
 
 (deftest filestore-compliance-test
   (let [folder "/tmp/konserve-fs-comp-test"

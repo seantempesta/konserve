@@ -4,6 +4,7 @@
             [hasch.core :as hasch]
             [konserve.protocols :as protocols :refer [-exists? -get-meta -get-in -assoc-in
                                                       -update-in -dissoc -bget -bassoc
+                                                      -bget-range
                                                       -keys -multi-get -multi-assoc -multi-dissoc
                                                       -assoc-serializers -get-write-hooks -lock-free?]]
             [konserve.utils :refer [meta-update multi-key-capable? invoke-write-hooks! #?(:clj async+sync) *default-sync-translation*]
@@ -653,6 +654,21 @@
                (maybe-go-locked
                 store key
                 (<?- (-bget store key locked-cb opts))))))
+
+(defn bget-range
+  "Returns at most `length` binary bytes beginning at `offset`.
+
+  The optional range protocol is currently implemented by the JVM file
+  backend. Reads are synchronous and allocate in proportion to the requested
+  range rather than the complete stored value."
+  ([store key offset length]
+   (bget-range store key offset length {:sync? true}))
+  ([store key offset length opts]
+   (when-not (:sync? opts)
+     (throw (ex-info "Binary range reads are synchronous."
+                     {:key key :opts opts})))
+   (maybe-locked store key
+                 (-bget-range store key offset length opts))))
 
 (defn bassoc
   "Copies given value (InputStream, Reader, File, byte[] or String on

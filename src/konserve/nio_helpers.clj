@@ -26,7 +26,7 @@
 
   File
   (blob->channel [input _buffer-size]
-    [(Channels/newChannel (FileInputStream. ^String input))
+    [(Channels/newChannel (FileInputStream. ^File input))
      (fn [bis buffer]  (.read ^ReadableByteChannel bis buffer))])
 
   String
@@ -61,4 +61,3 @@
   {:blob->channel (fn [input _]
                     [(Channels/newChannel (ByteArrayInputStream. (.getBytes (String. ^chars input))))
                      (fn [bis buffer] (.read ^ReadableByteChannel bis buffer))])})
-

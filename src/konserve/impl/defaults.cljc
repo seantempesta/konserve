@@ -9,6 +9,7 @@
    [konserve.encryptor :refer [get-encryptor]]
    [konserve.protocols :refer [PEDNKeyValueStore
                                PBinaryKeyValueStore
+                               PBinaryRangeStore
                                -serialize -deserialize
                                PAssocSerializers
                                PKeyIterable
@@ -21,6 +22,7 @@
                                          -migratable -migrate -handle-foreign-key
                                          -close -get-lock -sync
                                          -read-header -read-meta -read-value -read-binary
+                                         PBackingBinaryRangeStore -read-binary-range
                                          -write-header -write-meta -write-value -write-binary
                                          PBackingLock -release
                                          PMultiWriteBackingStore -multi-write-blobs -multi-delete-blobs
@@ -609,6 +611,21 @@
                      :buffer-size buffer-size
                      :msg        {:type :write-binary-error
                                   :key  key}})))
+
+  PBinaryRangeStore
+  (-bget-range [_ key offset length opts]
+    (when-not (:sync? opts)
+      (throw (ex-info "Binary range reads are synchronous."
+                      {:key key :opts opts})))
+    (when-not (satisfies? PBackingBinaryRangeStore backing)
+      (throw (ex-info "Backing store does not support binary range reads."
+                      {:key key :backing (type backing)})))
+    (-read-binary-range backing
+                        (key->store-key key)
+                        serializers
+                        offset
+                        length
+                        opts))
 
   PAssocSerializers
   (-assoc-serializers [this serializers]
