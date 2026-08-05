@@ -6,9 +6,18 @@
   #?(:clj (:import [java.util Date])))
 
 (defn sweep!
+  "Deletes keys outside the whitelist that precede the retention instant.
+
+  The optional `:konserve.gc/batch-issued` callback receives each realized
+  vector of encoded physical store-key strings after the batch is fixed and
+  before the backing store performs its first existence check or deletion.
+  The callback runs synchronously; returning normally admits that batch, while
+  throwing prevents the backing store from seeing it."
   ([store whitelist ts]
    (sweep! store whitelist ts 1000))
   ([store whitelist ts batch-size]
+   (sweep! store whitelist ts batch-size {}))
+  ([store whitelist ts batch-size opts]
    (go-try-
     (let [to-delete (->> (<?- (k/keys store))
                          (filter (fn [{:keys [key last-write] :as meta}]
@@ -27,7 +36,8 @@
            (if (utils/multi-key-capable? store)
              ;; Use multi-dissoc for batch deletion if supported
              (let [keys-to-delete (mapv :key batch)]
-               (<?- (k/multi-dissoc store keys-to-delete))
+               (<?- (k/multi-dissoc store keys-to-delete
+                                    (assoc opts :sync? false)))
                (into deleted-files keys-to-delete))
              ;; Fallback to single operations for stores without multi-key support.
              ;; GC does not use dissoc's existed? return, so :ignore-existence? lets

@@ -700,7 +700,9 @@
        sync? *default-sync-translation*
        (go-try-
         ;; Convert keys to store-keys
-        (let [store-keys (map key->store-key keys)
+        (let [store-keys (mapv key->store-key keys)
+              _ (when-let [batch-issued (:konserve.gc/batch-issued opts)]
+                  (batch-issued store-keys))
               env (merge opts {:sync? sync? :config config})
 
               ;; Use backing store's multi-delete capability
