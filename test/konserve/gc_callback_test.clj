@@ -70,3 +70,23 @@
                       expected-store-keys))))
       (finally
         (delete-store root)))))
+
+(deftest dry-run-selects-the-sweep-keys-without-deleting
+  (let [root (str "target/konserve-gc-dry-run/" (random-uuid))]
+    (try
+      (let [store (<!! (connect-fs-store root))
+            cutoff (future-date)
+            opts {:konserve.gc/dry-run? true
+                  :konserve.gc/batch-issued (fn [_] (throw (ex-info "unexpected delete" {})))}]
+        (is (= #{} (<!! (gc/sweep! store #{} cutoff 1 opts))))
+        (<!! (k/assoc store :retained 1))
+        (<!! (k/assoc store :garbage 2))
+        (is (= #{:garbage} (<!! (gc/sweep! store #{:retained} cutoff 1 opts))))
+        (is (= 2 (<!! (k/get store :garbage))))
+        (is (= #{} (<!! (gc/sweep! store #{} (Date. 0) 1 opts))))
+        (<!! (k/assoc store :another 3))
+        (is (= #{:garbage :another}
+               (<!! (gc/sweep! store #{:retained} cutoff 1 opts))
+               (<!! (gc/sweep! store #{:retained} cutoff 1))))
+        (is (= #{:retained} (into #{} (map :key) (<!! (k/keys store))))))
+      (finally (delete-store root)))))

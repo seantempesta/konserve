@@ -8,6 +8,9 @@
 (defn sweep!
   "Deletes keys outside the whitelist that precede the retention instant.
 
+  With `:konserve.gc/dry-run? true`, returns the selected logical keys without
+  deleting them or invoking deletion callbacks. Selection and batching are identical.
+
   The optional `:konserve.gc/batch-issued` callback receives each realized
   vector of encoded physical store-key strings after the batch is fixed and
   before the backing store performs its first existence check or deletion.
@@ -33,7 +36,9 @@
        (reduce<?-
         (fn [deleted-files batch]
           (go-try-
-           (if (utils/multi-key-capable? store)
+           (if (:konserve.gc/dry-run? opts)
+             (into deleted-files (map :key batch))
+             (if (utils/multi-key-capable? store)
              ;; Use multi-dissoc for batch deletion if supported
              (let [keys-to-delete (mapv :key batch)]
                (<?- (k/multi-dissoc store keys-to-delete
@@ -46,6 +51,6 @@
                                            (k/dissoc store key {:ignore-existence? true}))
                                          batch)]
                (<?- (async/into [] (async/merge pending-deletes)))
-               (into deleted-files (map :key batch))))))
+               (into deleted-files (map :key batch)))))))
         #{}
         to-delete))))))
