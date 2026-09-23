@@ -374,7 +374,7 @@
                   result)))))
 
 (defn multi-get
-  "Retrieves multiple values by keys in one backend operation.
+  "Atomically retrieves multiple values by keys.
   Takes a collection of keys and returns a sparse map containing only found keys.
   Uses flat keys only (not key-vecs).
 
@@ -468,7 +468,7 @@
   `{key -> meta-map}`, pure data so the whole map is forwarded verbatim on the write-hook
   (a consumer like konserve-sync can relay/serialize it). Each written value's metadata is
   merged with `(get meta key)` (built `{:key :type :last-write}` fields win). Keys absent
-  from `meta` get no extra metadata, so one batch can mark some keys immutable
+  from `meta` get no extra metadata, so one atomic batch can mark some keys immutable
   (content-addressed nodes) and leave others (a mutable branch-head pointer) unmarked. Use
   `uniform-meta` for the all-keys-same case.
 
@@ -526,9 +526,9 @@
                   result)))))
 
 (defn multi-dissoc
-  "Dissociates multiple keys with flat keys in one backend operation.
-  Takes a collection of keys to remove. Atomic backends may strengthen the
-  operation to all-or-nothing; other backends may expose an applied prefix.
+  "Atomically dissociates multiple keys with flat keys.
+  Takes a collection of keys to remove and deletes them in a single atomic transaction.
+  All operations must succeed or all must fail (all-or-nothing semantics).
 
   Example:
   ```

@@ -1,6 +1,7 @@
 (ns konserve.gc
   (:require [clojure.core.async :as async]
             [konserve.core :as k]
+            [konserve.impl.defaults :as defaults]
             [konserve.utils :as utils]
             [superv.async :refer [go-try- <?- reduce<?-]])
   #?(:clj (:import [java.util Date])))
@@ -47,7 +48,9 @@
              ;; Fallback to single operations for stores without multi-key support.
              ;; GC does not use dissoc's existed? return, so :ignore-existence? lets
              ;; miss-safe backings skip the per-key HEAD probe (idempotent delete).
-             (let [pending-deletes (mapv (fn [{:keys [key]}]
+             (let [_ (when-let [batch-issued (:konserve.gc/batch-issued opts)]
+                       (batch-issued (mapv (comp defaults/key->store-key :key) batch)))
+                   pending-deletes (mapv (fn [{:keys [key]}]
                                            (k/dissoc store key {:ignore-existence? true}))
                                          batch)]
                (<?- (async/into [] (async/merge pending-deletes)))

@@ -192,23 +192,23 @@
     "Returns at most length payload bytes from offset without a full read."))
 
 (defprotocol PMultiWriteBackingStore
-  "Protocol for backing stores that support multi-key writes."
+  "Protocol for backing stores that support atomic multi-key writes."
   (-multi-write-blobs [this store-key-values env]
-    "Write multiple blobs in a single ordered operation.
+    "Write multiple blobs atomically in a single operation.
      store-key-values is a sequence of [store-key serialized-data] pairs.
-     serialized-data is a map containing :header, :meta, and :value byte arrays.
+     serialized-data is a map containing :header, :meta-arr, and :value-arr.
      Returns a map of store-keys to success values (typically true).
      Backends must implement this to support multi-key operations.")
   (-multi-delete-blobs [this store-keys env]
-    "Delete multiple blobs in a single operation.
+    "Delete multiple blobs atomically in a single operation.
      store-keys is a sequence of store-key strings to delete.
      Returns a map of store-keys to boolean indicating if the blob existed before deletion.
      Backends must implement this to support multi-key operations."))
 
 (defprotocol PMultiReadBackingStore
-  "Protocol for backing stores that support multi-key reads."
+  "Protocol for backing stores that support atomic multi-key reads."
   (-multi-read-blobs [this store-keys env]
-    "Read multiple blobs in a single operation.
+    "Read multiple blobs atomically in a single operation.
      store-keys is a sequence of store-key strings to read.
      Returns a sparse map of {store-key -> blob} for found keys only.
      Missing keys are excluded from the result map.
