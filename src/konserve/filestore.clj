@@ -6,7 +6,7 @@
    [konserve.compressor :refer [null-compressor]]
    [konserve.encryptor :refer [null-encryptor]]
    [konserve.impl.defaults :refer [update-blob connect-default-store key->store-key store-key->uuid-key]]
-   [konserve.impl.storage-layout :refer [PBackingStore PDataSyncBackingStore
+   [konserve.impl.storage-layout :refer [PBackingStore PDataSyncBackingStore -deferred-sync?
                                          -create-blob -delete-blob -blob-exists?
                                          -atomic-move -sync-store
                                          PBackingBlob -close -sync
@@ -222,19 +222,18 @@
                  (sync-base filesystem base))))
 
   PDataSyncBackingStore
+  ;; Only the local filesystem on macOS: there `force` is F_FULLFSYNC and
+  ;; fsync(2) is the cheap data push; on Linux fsync(2) is already durable per
+  ;; file and the writer's own descriptor must keep observing writeback errors.
+  (-deferred-sync? [_this]
+    (and (nil? filesystem)
+         (.startsWith ^String (System/getProperty "os.name" "") "Mac")))
   (-sync-data [_this store-key env]
-    ;; fsync(2) through a read-only descriptor (`FileDescriptor.sync`): the
-    ;; file's data reaches the device without the whole-drive flush that
-    ;; `FileChannel.force` issues on macOS; `-sync-store` is the barrier.
-    ;; A custom FileSystem (Jimfs) has no descriptor: force its channel.
+    ;; fsync(2) through a read-only descriptor (`FileDescriptor.sync`).
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
-                 (let [path (get-path filesystem base store-key)]
-                   (if filesystem
-                     (with-open [fc (FileChannel/open path (into-array OpenOption [StandardOpenOption/READ]))]
-                       (.force fc true))
-                     (with-open [raf (RandomAccessFile. (.toFile path) "r")]
-                       (.sync (.getFD raf))))))))
+                 (with-open [raf (RandomAccessFile. (.toFile (get-path filesystem base store-key)) "r")]
+                   (.sync (.getFD raf))))))
 
   PBackingBinaryRangeStore
   (-read-binary-range [this store-key serializers offset length _env]

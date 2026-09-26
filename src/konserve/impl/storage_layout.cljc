@@ -188,15 +188,24 @@
 
 (defprotocol PDataSyncBackingStore
   "Optional. A backing store whose durability has two costs: pushing one blob's
-   data to the device, and a store-wide barrier that makes everything pushed
-   before it durable (`-sync-store`). On macOS the JDK's `FileChannel.force` is
-   `fcntl(F_FULLFSYNC)`, a whole-drive cache flush (~4 ms, device-serialized),
-   while `fsync(2)` only hands the data to the drive (~0.03 ms). A backing that
-   implements this lets `update-blob` push each blob with `-sync-data` and pay
-   the barrier only where order is observable: before and after a MUTABLE key
-   is replaced. An `{:immutable? true}` key is content-addressed and unreferenced
-   until a later mutable write names it, so the barrier in front of that write
-   makes it durable first."
+   data to the device, and a store-wide barrier (`-sync-store`) after which
+   everything pushed before it is durable. On macOS the JDK's `FileChannel.force`
+   is `fcntl(F_FULLFSYNC)`, a whole-drive cache flush (~4 ms, device-serialized),
+   while `fsync(2)` only hands the data to the drive (~0.03 ms).
+
+   A store whose config sets `:defer-immutable-sync? true` (default off) opts
+   into this contract: an `{:immutable? true}` key that was ABSENT before its
+   write becomes durable at the next successfully completed non-deferred write
+   in the same store, whose barrier runs before its move. Its completion and
+   write hook report staging, not durable publication. Opt in only when every
+   reference to such a key is published by a later write of this store (Datahike:
+   index nodes and the commit record precede the branch head). Every other write
+   of an opted-in store pays the barrier before and after its move; a store that
+   does not opt in, or a backing that answers false to `-deferred-sync?`, keeps
+   the per-write `-sync` + `-sync-store` sequence."
+  (-deferred-sync? [this]
+    "True when this backing's `-sync-data` + `-sync-store` pair carries the
+     contract above (the local filestore on macOS; not Linux, custom filesystems).")
   (-sync-data [this store-key env]
     "Push the data of the blob at `store-key` to the device without a store-wide barrier."))
 

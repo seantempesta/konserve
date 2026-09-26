@@ -28,7 +28,7 @@
                                          PMultiWriteBackingStore -multi-write-blobs -multi-delete-blobs
                                          PMultiReadBackingStore -multi-read-blobs
                                          PReadMissSafe store-key-not-found?
-                                         PDataSyncBackingStore -sync-data
+                                         PDataSyncBackingStore -sync-data -deferred-sync?
                                          default-version
                                          parse-header create-header header-size]]
    [konserve.utils  #?@(:clj [:refer [async+sync *default-sync-translation*]]
@@ -57,6 +57,25 @@
 
 #?(:cljs (extend-type js/Uint8Array ICounted (-count [this] (alength this))))
 
+(defn sync-plan
+  "How `update-blob` makes one write durable.
+   :per-write  the writer's `-sync`, move, `-sync-store` (no opt-in, or a backing
+               that cannot defer);
+   :deferred   `-sync-data` and move, no barrier: an immutable key absent before
+               this write in a store that opted in (`:defer-immutable-sync?`);
+   :barriered  `-sync-data`, `-sync-store`, move, `-sync-store`: every other write
+               of an opted-in store, so everything written before it (the deferred
+               keys it may name) is durable before it replaces its predecessor,
+               and an existing immutable key's replacement is durable before it
+               becomes visible."
+  [backing config immutable? existed?]
+  (cond
+    (not (and (:defer-immutable-sync? config) (:sync-blob? config) (not (:in-place? config))
+              (satisfies? PDataSyncBackingStore backing) (-deferred-sync? backing)))
+    :per-write
+    (and immutable? (false? existed?)) :deferred
+    :else :barriered))
+
 (defn update-blob
   "This function writes first the meta-size, then the meta-data and then the
   actual updated data into the underlying backing store."
@@ -81,9 +100,9 @@
                                  (.close bos))))))
 
           meta  (up-fn-meta old-meta)
-          immutable? (boolean (:immutable? meta))
-          deferred? (and (:sync-blob? config) (not (:in-place? config))
-                         (satisfies? PDataSyncBackingStore backing))
+          ;; `:existed?` is io-operation's answer from before it opened the
+          ;; destination (nil when it did not ask): absence is never inferred.
+          plan (sync-plan backing config (boolean (:immutable? meta)) (:existed? env))
           value (when (= operation :write-edn)
                   (if-not (empty? rkey)
                     (update-in old-value rkey up-fn)
@@ -108,18 +127,14 @@
           (let [value-arr (to-array value)]
             (<?- (-write-value new-blob value-arr meta-size env))))
 
-        (when (and (:sync-blob? config) (not deferred?))
+        (when (and (:sync-blob? config) (= plan :per-write))
           (log/trace :konserve/syncing-blob {:key key})
           (<?- (-sync new-blob env)))
         (<?- (-close new-blob env))
 
-        ;; Deferred barrier (PDataSyncBackingStore): push this blob's data; a
-        ;; mutable key then waits for one store-wide barrier, so every key
-        ;; written before it (the immutable values it names) is durable before
-        ;; it replaces its predecessor. An immutable key pays no barrier.
-        (when deferred?
+        (when-not (= plan :per-write)
           (<?- (-sync-data backing new-store-key env))
-          (when-not immutable?
+          (when (= plan :barriered)
             (log/trace :konserve/syncing-store {:key key :barrier :before-move})
             (<?- (-sync-store backing env))))
 
@@ -127,7 +142,7 @@
           (log/trace :konserve/moving-blob {:key key})
           (<?- (-atomic-move backing new-store-key store-key env)))
 
-        (when (and (:sync-blob? config) (not (and deferred? immutable?)))
+        (when (and (:sync-blob? config) (not= plan :deferred))
           (log/trace :konserve/syncing-store {:key key})
           (<?- (-sync-store backing env)))
 
@@ -309,6 +324,12 @@
                             skip-write-probe?)
           store-key-exists? (when-not skip-exists?
                               (<?- (-blob-exists? backing store-key env)))
+          ;; A store deferring immutable syncs needs the destination's existence
+          ;; from BEFORE -create-blob opens it with CREATE (sync-plan).
+          existed? (when (and write-op? (:defer-immutable-sync? config))
+                     (if (some? store-key-exists?)
+                       store-key-exists?
+                       (<?- (-blob-exists? backing store-key env))))
           max-retries (get-in config [:optimistic-locking-retries] 0)]
       (cond
         ;; Read-first (PReadMissSafe): no existence probe — read the blob and
@@ -358,7 +379,8 @@
                                   (<?- (read-blob blob read-handlers serializers env))
                                   :else [nil nil])]
                         (if write-op?
-                          (<?- (update-blob backing store-key serializer write-handlers env old))
+                          (<?- (update-blob backing store-key serializer write-handlers
+                                            (cond-> env (some? existed?) (assoc :existed? existed?)) old))
                           old))
                       (finally
                         (when (:lock-blob? config)

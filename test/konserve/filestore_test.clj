@@ -4,6 +4,7 @@
             [clojure.test :refer [deftest is testing]]
             [clojure.core.async :refer [<!! go chan put! close! <!] :as async]
             [konserve.core :as k :refer [bassoc bget keys]]
+            [konserve.impl.defaults :as defaults]
             [konserve.impl.storage-layout :refer [PDataSyncBackingStore]]
             [konserve.compliance-test :refer [compliance-test]]
             [konserve.filestore :refer [connect-fs-store delete-store]]
@@ -82,18 +83,41 @@
     (testing "Compliance test with default config."
       (compliance-test store))))
 
-(deftest immutable-values-are-durable-through-the-next-mutable-write
-  ;; A filestore defers the store-wide barrier (F_FULLFSYNC on macOS) for
-  ;; `{:immutable? true}` keys to the next mutable write, which pays it before
-  ;; and after its move: nodes, then the commit record, then the head that
-  ;; names them, in a Datahike commit's order. Every value reads back, every
-  ;; staged `.new` blob is moved, and only the mutable key lacks the marker.
-  (let [folder "/tmp/konserve-fs-deferred-barrier-test"
+(deftest sync-plan-defers-only-new-immutable-keys-of-an-opted-in-store
+  ;; The only write allowed to skip the store-wide barrier is an immutable key
+  ;; that was absent before its write, in a store that opted in, on a backing
+  ;; that can defer. An existing immutable key (a replacement of something a
+  ;; durable head may already name) and every mutable key pay the barrier
+  ;; before and after the move; without the opt-in nothing changes.
+  (let [folder "/tmp/konserve-fs-sync-plan-test"
         _      (delete-store folder)
         store  (connect-fs-store folder :opts {:sync? true})
+        backing (:backing store)
+        opted (clojure.core/assoc (:config store) :defer-immutable-sync? true)
+        mac? (.startsWith ^String (System/getProperty "os.name" "") "Mac")]
+    (try
+      (is (satisfies? PDataSyncBackingStore backing))
+      (is (= :per-write (defaults/sync-plan backing (:config store) true false))
+          "no opt-in: the parent's per-write sequence")
+      (is (= :per-write (defaults/sync-plan backing (clojure.core/assoc opted :sync-blob? false) true false)))
+      (is (= :per-write (defaults/sync-plan backing (clojure.core/assoc opted :in-place? true) true false)))
+      (if mac?
+        (do (is (= :deferred (defaults/sync-plan backing opted true false)))
+            (is (= :barriered (defaults/sync-plan backing opted true true)) "existing immutable key")
+            (is (= :barriered (defaults/sync-plan backing opted true nil)) "existence unknown")
+            (is (= :barriered (defaults/sync-plan backing opted false false)) "mutable key"))
+        (is (= :per-write (defaults/sync-plan backing opted true false)) "only macOS defers"))
+      (finally (delete-store folder)))))
+
+(deftest an-opted-in-store-publishes-in-datahike-order-and-replaces-immutable-keys
+  ;; Nodes, then the commit record, then the head that names them; then the
+  ;; same immutable node written again with new bytes (the barriered path).
+  ;; Every value reads back, the marker is kept, no staged `.new` blob is left.
+  (let [folder "/tmp/konserve-fs-deferred-barrier-test"
+        _      (delete-store folder)
+        store  (connect-fs-store folder :opts {:sync? true} :config {:defer-immutable-sync? true})
         nodes  (mapv (fn [i] (vec (range (* 100 i)))) (range 1 6))]
     (try
-      (is (satisfies? PDataSyncBackingStore (:backing store)))
       (<!! (async/go
              (let [ops (mapv (fn [i v] (k/assoc store [:node i] v {:immutable? true} {:sync? false}))
                              (range) nodes)]
@@ -104,6 +128,8 @@
       (is (= {:commit :commit} (k/get store :head nil {:sync? true})))
       (is (true? (:immutable? (k/get-meta store :commit nil {:sync? true}))))
       (is (nil? (:immutable? (k/get-meta store :head nil {:sync? true}))))
+      (k/assoc store [:node 0] [:replaced] {:immutable? true} {:sync? true})
+      (is (= [:replaced] (k/get store [:node 0] nil {:sync? true})))
       (is (empty? (filter #(.endsWith ^String % ".new") (.list (io/file folder)))))
       (finally (delete-store folder)))))
 
