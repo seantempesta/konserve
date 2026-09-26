@@ -3,7 +3,8 @@
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [clojure.core.async :refer [<!! go chan put! close! <!] :as async]
-            [konserve.core :refer [bassoc bget keys]]
+            [konserve.core :as k :refer [bassoc bget keys]]
+            [konserve.impl.storage-layout :refer [PDataSyncBackingStore]]
             [konserve.compliance-test :refer [compliance-test]]
             [konserve.filestore :refer [connect-fs-store delete-store]]
             [konserve.tests.cache :as ct]
@@ -80,6 +81,31 @@
         store  (<!! (connect-fs-store folder))]
     (testing "Compliance test with default config."
       (compliance-test store))))
+
+(deftest immutable-values-are-durable-through-the-next-mutable-write
+  ;; A filestore defers the store-wide barrier (F_FULLFSYNC on macOS) for
+  ;; `{:immutable? true}` keys to the next mutable write, which pays it before
+  ;; and after its move: nodes, then the commit record, then the head that
+  ;; names them, in a Datahike commit's order. Every value reads back, every
+  ;; staged `.new` blob is moved, and only the mutable key lacks the marker.
+  (let [folder "/tmp/konserve-fs-deferred-barrier-test"
+        _      (delete-store folder)
+        store  (connect-fs-store folder :opts {:sync? true})
+        nodes  (mapv (fn [i] (vec (range (* 100 i)))) (range 1 6))]
+    (try
+      (is (satisfies? PDataSyncBackingStore (:backing store)))
+      (<!! (async/go
+             (let [ops (mapv (fn [i v] (k/assoc store [:node i] v {:immutable? true} {:sync? false}))
+                             (range) nodes)]
+               (doseq [op ops] (<! op)))
+             (<! (k/assoc store :commit {:nodes (count nodes)} {:immutable? true} {:sync? false}))
+             (<! (k/assoc store :head {:commit :commit} {:sync? false}))))
+      (is (= nodes (mapv #(k/get store [:node %] nil {:sync? true}) (range (count nodes)))))
+      (is (= {:commit :commit} (k/get store :head nil {:sync? true})))
+      (is (true? (:immutable? (k/get-meta store :commit nil {:sync? true}))))
+      (is (nil? (:immutable? (k/get-meta store :head nil {:sync? true}))))
+      (is (empty? (filter #(.endsWith ^String % ".new") (.list (io/file folder)))))
+      (finally (delete-store folder)))))
 
 (deftest filestore-compliance-test-no-fsync
   (let [folder "/tmp/konserve-fs-comp-test"

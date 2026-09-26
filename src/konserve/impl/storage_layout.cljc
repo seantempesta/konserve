@@ -186,6 +186,20 @@
   (-keys [this env] "List all the keys representing blobs in the store.")
   (-handle-foreign-key [this migration-key serializer read-handlers write-handlers env] "Handle keys not recognized by the current konserve version."))
 
+(defprotocol PDataSyncBackingStore
+  "Optional. A backing store whose durability has two costs: pushing one blob's
+   data to the device, and a store-wide barrier that makes everything pushed
+   before it durable (`-sync-store`). On macOS the JDK's `FileChannel.force` is
+   `fcntl(F_FULLFSYNC)`, a whole-drive cache flush (~4 ms, device-serialized),
+   while `fsync(2)` only hands the data to the drive (~0.03 ms). A backing that
+   implements this lets `update-blob` push each blob with `-sync-data` and pay
+   the barrier only where order is observable: before and after a MUTABLE key
+   is replaced. An `{:immutable? true}` key is content-addressed and unreferenced
+   until a later mutable write names it, so the barrier in front of that write
+   makes it durable first."
+  (-sync-data [this store-key env]
+    "Push the data of the blob at `store-key` to the device without a store-wide barrier."))
+
 (defprotocol PBackingBinaryRangeStore
   "Optional bounded binary reads implemented by range-capable backings."
   (-read-binary-range [this store-key serializers offset length env]

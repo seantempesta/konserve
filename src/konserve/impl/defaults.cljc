@@ -28,6 +28,7 @@
                                          PMultiWriteBackingStore -multi-write-blobs -multi-delete-blobs
                                          PMultiReadBackingStore -multi-read-blobs
                                          PReadMissSafe store-key-not-found?
+                                         PDataSyncBackingStore -sync-data
                                          default-version
                                          parse-header create-header header-size]]
    [konserve.utils  #?@(:clj [:refer [async+sync *default-sync-translation*]]
@@ -80,6 +81,9 @@
                                  (.close bos))))))
 
           meta  (up-fn-meta old-meta)
+          immutable? (boolean (:immutable? meta))
+          deferred? (and (:sync-blob? config) (not (:in-place? config))
+                         (satisfies? PDataSyncBackingStore backing))
           value (when (= operation :write-edn)
                   (if-not (empty? rkey)
                     (update-in old-value rkey up-fn)
@@ -104,16 +108,26 @@
           (let [value-arr (to-array value)]
             (<?- (-write-value new-blob value-arr meta-size env))))
 
-        (when (:sync-blob? config)
+        (when (and (:sync-blob? config) (not deferred?))
           (log/trace :konserve/syncing-blob {:key key})
           (<?- (-sync new-blob env)))
         (<?- (-close new-blob env))
+
+        ;; Deferred barrier (PDataSyncBackingStore): push this blob's data; a
+        ;; mutable key then waits for one store-wide barrier, so every key
+        ;; written before it (the immutable values it names) is durable before
+        ;; it replaces its predecessor. An immutable key pays no barrier.
+        (when deferred?
+          (<?- (-sync-data backing new-store-key env))
+          (when-not immutable?
+            (log/trace :konserve/syncing-store {:key key :barrier :before-move})
+            (<?- (-sync-store backing env))))
 
         (when-not (:in-place? config)
           (log/trace :konserve/moving-blob {:key key})
           (<?- (-atomic-move backing new-store-key store-key env)))
 
-        (when (:sync-blob? config)
+        (when (and (:sync-blob? config) (not (and deferred? immutable?)))
           (log/trace :konserve/syncing-store {:key key})
           (<?- (-sync-store backing env)))
 

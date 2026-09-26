@@ -6,7 +6,7 @@
    [konserve.compressor :refer [null-compressor]]
    [konserve.encryptor :refer [null-encryptor]]
    [konserve.impl.defaults :refer [update-blob connect-default-store key->store-key store-key->uuid-key]]
-   [konserve.impl.storage-layout :refer [PBackingStore
+   [konserve.impl.storage-layout :refer [PBackingStore PDataSyncBackingStore
                                          -create-blob -delete-blob -blob-exists?
                                          -atomic-move -sync-store
                                          PBackingBlob -close -sync
@@ -19,7 +19,7 @@
    [superv.async :refer [go-try- <?-]]
    [replikativ.logging :as log])
   (:import
-   [java.io ByteArrayInputStream FileInputStream Closeable]
+   [java.io ByteArrayInputStream FileInputStream Closeable RandomAccessFile]
    [java.nio.channels FileChannel AsynchronousFileChannel CompletionHandler FileLock]
    [java.nio ByteBuffer]
    [java.nio.file Files NoSuchFileException StandardCopyOption FileSystem FileSystems Path Paths OpenOption LinkOption StandardOpenOption]
@@ -220,6 +220,21 @@
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
                  (sync-base filesystem base))))
+
+  PDataSyncBackingStore
+  (-sync-data [_this store-key env]
+    ;; fsync(2) through a read-only descriptor (`FileDescriptor.sync`): the
+    ;; file's data reaches the device without the whole-drive flush that
+    ;; `FileChannel.force` issues on macOS; `-sync-store` is the barrier.
+    ;; A custom FileSystem (Jimfs) has no descriptor: force its channel.
+    (async+sync (:sync? env) *default-sync-translation*
+                (go-try-
+                 (let [path (get-path filesystem base store-key)]
+                   (if filesystem
+                     (with-open [fc (FileChannel/open path (into-array OpenOption [StandardOpenOption/READ]))]
+                       (.force fc true))
+                     (with-open [raf (RandomAccessFile. (.toFile path) "r")]
+                       (.sync (.getFD raf))))))))
 
   PBackingBinaryRangeStore
   (-read-binary-range [this store-key serializers offset length _env]
