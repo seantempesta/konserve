@@ -1,7 +1,8 @@
 (ns konserve.compressor
   (:require [konserve.protocols :refer [PStoreSerializer -serialize -deserialize]]
             [konserve.utils :refer [invert-map]])
-  #?(:clj (:import [net.jpountz.lz4 LZ4FrameOutputStream LZ4FrameInputStream])))
+  #?(:clj (:import [net.jpountz.lz4 LZ4FrameOutputStream LZ4FrameOutputStream$BLOCKSIZE
+                    LZ4FrameInputStream])))
 
 (defrecord NullCompressor [serializer]
   PStoreSerializer
@@ -24,7 +25,14 @@
        (let [lz4-byte (LZ4FrameInputStream. bytes)]
          (-deserialize serializer read-handlers lz4-byte)))
      (-serialize [_ bytes write-handlers val]
-       (let [lz4-byte (LZ4FrameOutputStream. bytes)]
+       ;; 64 KiB frame blocks. The stream's default is 4 MiB, and both
+       ;; LZ4FrameOutputStream and the LZ4FrameInputStream that reads the frame
+       ;; back allocate buffers of the frame's block size per value: a few-KB
+       ;; value paid ~70 us to write and ~95 us to read in allocation alone
+       ;; (13x/7x the 64 KiB cost), for the same compressed size. The input
+       ;; stream sizes its buffers from each frame's own descriptor, so frames
+       ;; written with the old block size stay readable.
+       (let [lz4-byte (LZ4FrameOutputStream. bytes LZ4FrameOutputStream$BLOCKSIZE/SIZE_64KB)]
          (-serialize serializer lz4-byte write-handlers val)
          (.flush lz4-byte)))))
 
