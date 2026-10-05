@@ -2,6 +2,7 @@
   (:require [clojure.core.async :refer [go <! timeout alts! promise-chan put! close!]]
             [clojure.test :refer [is testing]]
             [konserve.core :as k]
+            [konserve.memory :as memory]
             [konserve.tiered :as tiered]
             [konserve.compliance-test :refer [async-compliance-test] :as ct]
             [superv.async :refer [<?-]]))
@@ -100,7 +101,28 @@
         (<?- (k/assoc-in backend-store [:cached] {:v 99}))
         (<?- (k/dissoc store :cached))
         (is (nil? (<?- (k/get-in frontend-store [:cached]))) "dissoc removed from frontend")
-        (is (= {:v 99} (<?- (k/get-in backend-store [:cached]))) "backend copy untouched by dissoc")))))
+        (is (= {:v 99} (<?- (k/get-in backend-store [:cached]))) "backend copy untouched by dissoc")))
+    (testing "Frontend-only updates start from the backend's value; a warm never replaces a write"
+      (<?- (k/assoc-in backend-store [:roster] #{:db :x}))
+      (let [store (<?- (tiered/connect-tiered-store frontend-store backend-store
+                                                    :write-policy :frontend-only
+                                                    :read-policy :frontend-first))]
+        (<?- (k/update store :roster #(conj (set %) :a)))
+        (is (= #{:db :x :a} (<?- (k/get store :roster))) "an update of an uncached key keeps the backend's value"))
+      ;; A cold synchronous read schedules its warm; the update right after usually
+      ;; lands first, so the warm arrives late (unfixed: 178 of 200 rounds lost the
+      ;; update). Each round uses a fresh frontend so the read is cold.
+      (dotimes [round 20]
+        (let [sync {:sync? true}
+              store (tiered/connect-tiered-store (memory/new-mem-store (atom {}) sync) backend-store
+                                                 :write-policy :frontend-only
+                                                 :read-policy :frontend-first
+                                                 :opts sync)]
+          (k/get store :roster nil sync)
+          (k/update store :roster #(conj (set %) round) sync)
+          (<! (timeout 5))
+          (is (= (conj #{:db :x} round) (k/get store :roster nil sync))
+              "the late warm left the update in place"))))))
 
 (defn test-read-policies-async [frontend-store backend-store]
   (go

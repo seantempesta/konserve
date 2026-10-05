@@ -164,6 +164,19 @@
                   :root-keys (count root-keys)
                   :reachable-keys (count reachable-keys)}))))
 
+(defn- warm!
+  "Cache `value`, read from the backend, as `key`'s frontend value unless the
+   frontend already holds one. A read warms asynchronously, so its warm can land
+   after a write it never saw; replacing that write hands every later read the
+   stale backend value, and under `:frontend-only` the write existed nowhere
+   else (an overlay's `:branches` roster lost the branch just created).
+   Atomic where the frontend's `-update-in` is (the memory store's `swap!`)."
+  [frontend-store key value opts]
+  (-update-in frontend-store [key]
+              (fn [held-meta] (if (empty? held-meta) (meta-update key :edn held-meta) held-meta))
+              (fn [held] (if (some? held) held value))
+              opts))
+
 (defrecord TieredStore [frontend-store backend-store write-policy read-policy locks config]
   PEDNKeyValueStore
   (-exists? [_this key opts]
@@ -207,10 +220,11 @@
                      (if (not= frontend-result ::missing)
                        frontend-result  ;; Cache hit
                        (let [backend-result (<?- (-get-in backend-store key-vec ::missing opts))]
-                         (when (not= backend-result ::missing)
-                           ;; Populate frontend asynchronously (fire-and-forget)
+                         ;; Populate frontend asynchronously (fire-and-forget), never over a
+                         ;; value it holds by then; a nested read is not the key's whole value
+                         (when (and (not= backend-result ::missing) (= 1 (count key-vec)))
                            (go (try
-                                 (<?- (-assoc-in frontend-store key-vec (partial meta-update (first key-vec) :edn) backend-result opts))
+                                 (<?- (warm! frontend-store (first key-vec) backend-result opts))
                                  (invoke-write-hooks! frontend-store {:api-op :assoc-in
                                                                       :key (first key-vec)
                                                                       :key-vec key-vec
@@ -259,7 +273,15 @@
 
                    :frontend-only
                    ;; Cache mode: write to the frontend only; never touch the backend.
-                   (<?- (-update-in frontend-store key-vec meta-up-fn up-fn opts))))))
+                   ;; The update starts from the backend's value when the frontend holds
+                   ;; none yet: from nothing it would drop that value (a roster update
+                   ;; kept only its new branch).
+                   (let [key (first key-vec)]
+                     (when-not (<?- (-exists? frontend-store key opts))
+                       (let [held (<?- (-get-in backend-store [key] ::missing opts))]
+                         (when (not= held ::missing)
+                           (<?- (warm! frontend-store key held opts)))))
+                     (<?- (-update-in frontend-store key-vec meta-up-fn up-fn opts)))))))
 
   (-assoc-in [_this key-vec meta-up-fn val opts]
     (log/trace :konserve/tiered-assoc-in {:key-vec key-vec})
@@ -463,7 +485,8 @@
                          ;; Populate frontend asynchronously with found backend values (fire-and-forget)
                          (when (seq backend-result)
                            (go (try
-                                 (<?- (-multi-assoc frontend-store backend-result meta-update opts))
+                                 (doseq [[key value] backend-result]
+                                   (<?- (warm! frontend-store key value opts)))
                                  (invoke-write-hooks! frontend-store {:api-op :multi-assoc
                                                                       :kvs backend-result})
                                  (catch #?(:clj Exception :cljs js/Error) e
