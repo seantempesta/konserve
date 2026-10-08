@@ -672,19 +672,33 @@
 
 (defn bassoc
   "Copies given value (InputStream, Reader, File, byte[] or String on
-  JVM, Blob in JavaScript) under key in the store."
+  JVM, Blob in JavaScript) under key in the store.
+
+   The optional `meta` MAP is merged into the stored metadata as in `assoc`:
+   `{:immutable? true}` marks a content-addressed (write-once) value.
+
+   `{:compress? true}` in `opts` passes the bytes through the store's compressor
+   when that makes them smaller (JVM; not a Reader). The value is then read into
+   memory whole to compress it, and its metadata records `:compressed? true` and
+   the uncompressed `:size`; `bget` and `bget-range` read it back uncompressed."
   ([store key val]
-   (bassoc store key val {:sync? false}))
+   (bassoc store key val nil {:sync? false}))
   ([store key val opts]
+   (bassoc store key val nil opts))
+  ([store key val meta opts]
    (log/trace :konserve/bassoc {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
                (maybe-go-locked
                 store key
-                (let [result (<?- (-bassoc store key (partial meta-update key :binary) val opts))]
-                  (invoke-write-hooks! store {:api-op :bassoc
-                                              :key key
-                                              :value val})
+                (let [mfn    (if meta
+                               (fn [old] (clojure.core/merge meta (meta-update key :binary old)))
+                               (partial meta-update key :binary))
+                      result (<?- (-bassoc store key mfn val opts))]
+                  (invoke-write-hooks! store (cond-> {:api-op :bassoc
+                                                      :key key
+                                                      :value val}
+                                               meta (clojure.core/assoc :meta meta)))
                   result)))))
 
 (defn keys

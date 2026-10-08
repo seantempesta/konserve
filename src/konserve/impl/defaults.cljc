@@ -5,8 +5,9 @@
    [clojure.string :refer [ends-with?]]
    [hasch.core :refer [uuid]]
    [konserve.serializers :refer [key->serializer]]
-   [konserve.compressor :refer [get-compressor]]
-   [konserve.encryptor :refer [get-encryptor]]
+   [konserve.compressor :refer [get-compressor null-compressor
+                                #?@(:clj [compress-octets decompressing-stream])]]
+   [konserve.encryptor :refer [get-encryptor null-encryptor]]
    [konserve.protocols :refer [PEDNKeyValueStore
                                PBinaryKeyValueStore
                                PBinaryRangeStore
@@ -76,6 +77,35 @@
     (and immutable? (false? existed?)) :deferred
     :else :barriered))
 
+#?(:clj
+   (defn- binary-octets
+     "The bytes of a binary input `compress-octets` can take, or nil (a Reader)."
+     ^bytes [input]
+     (cond
+       (bytes? input) input
+       (string? input) (.getBytes ^String input)
+       (instance? java.io.File input) (java.nio.file.Files/readAllBytes (.toPath ^java.io.File input))
+       (instance? java.io.InputStream input) (.readAllBytes ^java.io.InputStream input)
+       :else nil)))
+
+(defn- binary-write
+  "The input and metadata a binary write stores: compressed with the store's
+  compressor when `compress?` asks and that makes it smaller. A binary write
+  always restates `:compressed?` and `:size`, so a rewrite never keeps the
+  previous value's."
+  [compressor encryptor compress? input meta]
+  (let [meta (dissoc meta :compressed? :size)]
+    #?(:clj
+       (if-let [octets (when (and compress?
+                                  (not= compressor null-compressor)
+                                  (= encryptor null-encryptor))
+                         (binary-octets input))]
+         (if-let [compressed (compress-octets compressor octets)]
+           [compressed (assoc meta :compressed? true :size (alength octets))]
+           [octets meta])
+         [input meta])
+       :cljs [input meta])))
+
 (defn update-blob
   "This function writes first the meta-size, then the meta-data and then the
   actual updated data into the underlying backing store."
@@ -99,7 +129,10 @@
                                (finally
                                  (.close bos))))))
 
-          meta  (up-fn-meta old-meta)
+          [input meta] (if (= operation :write-binary)
+                         (binary-write compressor encryptor (:compress? env)
+                                       input (up-fn-meta old-meta))
+                         [input (up-fn-meta old-meta)])
           ;; `:existed?` is io-operation's answer from before it opened the
           ;; destination (nil when it did not ask): absence is never inferred.
           plan (sync-plan backing config (boolean (:immutable? meta)) (:existed? env))
@@ -218,7 +251,22 @@
                             value     (fn-read bais-value)
                             _          (.close bais-value)]
                         [meta value]))
-        :read-binary (<?- (-read-binary blob meta-size locked-cb env)))))))
+        :read-binary
+        #?(:cljs (<?- (-read-binary blob meta-size locked-cb env))
+           :clj
+           (let [meta (when-not (= compressor null-compressor)
+                        (with-open [bais-read (ByteArrayInputStream.
+                                               (<?- (-read-meta blob meta-size env)))]
+                          (fn-read bais-read)))
+                 locked-cb (if (:compressed? meta)
+                             (fn [binary]
+                               (locked-cb
+                                (assoc binary
+                                       :input-stream (decompressing-stream
+                                                      compressor (:input-stream binary))
+                                       :size (:size meta))))
+                             locked-cb)]
+             (<?- (-read-binary blob meta-size locked-cb env)))))))))
 
 (defn delete-blob
   "Remove/Delete key-value pair of backing store by given key. Returns true if the
@@ -640,6 +688,7 @@
                      :compressor compressor
                      :encryptor  encryptor
                      :input      input
+                     :compress?  (:compress? opts)
                      :version version
                      :up-fn-meta meta-up
                      :config     config

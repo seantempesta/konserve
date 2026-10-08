@@ -36,6 +36,38 @@
          (-serialize serializer lz4-byte write-handlers val)
          (.flush lz4-byte)))))
 
+;; A binary value has no serializer: its bytes are the value. This identity
+;; serializer lets a binary payload pass through a store compressor. It closes
+;; the stream it writes to, so the compressor's frame is complete (Lz4Compressor
+;; only flushes, which leaves an LZ4 frame without its end mark: Fressian stops
+;; reading before it, a raw read of the whole stream does not).
+#?(:clj
+   (def ^:private octets-serializer
+     (reify PStoreSerializer
+       (-serialize [_ out _write-handlers octets]
+         (.write ^java.io.OutputStream out ^bytes octets)
+         (.close ^java.io.OutputStream out))
+       (-deserialize [_ _read-handlers in]
+         in))))
+
+#?(:clj
+   (defn compress-octets
+     "`octets` passed through `compressor`, or nil when that does not make them
+     smaller."
+     [compressor ^bytes octets]
+     (let [out (java.io.ByteArrayOutputStream.)]
+       (-serialize (compressor octets-serializer) out nil octets)
+       (let [compressed (.toByteArray out)]
+         (when (< (alength compressed) (alength octets))
+           compressed)))))
+
+#?(:clj
+   (defn decompressing-stream
+     "An input stream of the octets `compress-octets` passed through
+     `compressor`, read from `in`."
+     ^java.io.InputStream [compressor in]
+     (-deserialize (compressor octets-serializer) nil in)))
+
 (defn null-compressor [serializer]
   (NullCompressor. serializer))
 

@@ -76,6 +76,57 @@
         (io/delete-file payload-file true)
         (io/delete-file (io/file root) true)))))
 
+;; A binary written with `:compress? true` passes through the store compressor
+;; and reads back whole and by range; metadata given to `bassoc` is stored.
+(deftest binary-values-compress-through-the-store-compressor
+  (let [store-path (str "target/konserve-binary-compress-test/" (random-uuid))
+        text (.getBytes (apply str (repeat 2000 "{:seon/key :value :n 12345}\n")) "UTF-8")
+        noise (let [bs (byte-array 20000)] (.nextBytes (java.util.Random. 7) bs) bs)
+        read-all (fn [store key]
+                   (bget store key
+                         (fn [{:keys [input-stream]}]
+                           (.readAllBytes ^java.io.InputStream input-stream))
+                         {:sync? true}))
+        range-of (fn [^bytes bs offset length]
+                   (java.util.Arrays/copyOfRange
+                    bs (int (min offset (alength bs))) (int (min (+ offset length) (alength bs)))))
+        file-size (fn [key] (.length (io/file store-path (defaults/key->store-key key))))]
+    (try
+      (let [store (connect-fs-store store-path :opts {:sync? true}
+                                    :config {:compressor {:type :lz4}})]
+        (testing "compressible bytes are stored compressed and read back unchanged"
+          (is (true? (bassoc store :text text {:immutable? true} {:sync? true :compress? true})))
+          (is (= {:immutable? true :compressed? true :size (alength text) :type :binary}
+                 (select-keys (k/get-meta store :text nil {:sync? true})
+                              [:immutable? :compressed? :size :type])))
+          (is (< (file-size :text) (quot (alength text) 10)))
+          (is (java.util.Arrays/equals text ^bytes (read-all store :text)))
+          (doseq [[offset length] [[0 10] [1000 100] [(- (alength text) 5) 100] [(+ (alength text) 1) 10]]]
+            (is (java.util.Arrays/equals ^bytes (range-of text offset length)
+                                         ^bytes (k/bget-range store :text offset length))
+                (str "range " offset " " length))))
+        (testing "bytes compression does not shrink are stored as they are"
+          (is (true? (bassoc store :noise noise nil {:sync? true :compress? true})))
+          (is (nil? (:compressed? (k/get-meta store :noise nil {:sync? true}))))
+          (is (java.util.Arrays/equals noise ^bytes (read-all store :noise)))
+          (is (java.util.Arrays/equals ^bytes (range-of noise 100 50)
+                                       ^bytes (k/bget-range store :noise 100 50))))
+        (testing "an uncompressed write on a compressing store stays raw, and a rewrite drops the marker"
+          (is (true? (bassoc store :text text {:sync? true})))
+          (is (nil? (:compressed? (k/get-meta store :text nil {:sync? true}))))
+          (is (> (file-size :text) (alength text)))
+          (is (java.util.Arrays/equals text ^bytes (read-all store :text)))
+          (is (java.util.Arrays/equals ^bytes (range-of text 1000 100)
+                                       ^bytes (k/bget-range store :text 1000 100)))))
+      (let [store (connect-fs-store (str store-path "-null") :opts {:sync? true})]
+        (testing "a store without a compressor ignores :compress?"
+          (is (true? (bassoc store :text text nil {:sync? true :compress? true})))
+          (is (nil? (:compressed? (k/get-meta store :text nil {:sync? true}))))
+          (is (java.util.Arrays/equals text ^bytes (read-all store :text)))))
+      (finally
+        (delete-store store-path)
+        (delete-store (str store-path "-null"))))))
+
 (deftest filestore-compliance-test
   (let [folder "/tmp/konserve-fs-comp-test"
         _      (delete-store folder)

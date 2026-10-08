@@ -3,7 +3,7 @@
    [clojure.core.async :refer [go <!! chan close! put!]]
    [clojure.java.io :as io]
    [clojure.string :refer [includes? ends-with?]]
-   [konserve.compressor :refer [null-compressor]]
+   [konserve.compressor :refer [null-compressor decompressing-stream]]
    [konserve.encryptor :refer [null-encryptor]]
    [konserve.impl.defaults :refer [update-blob connect-default-store key->store-key store-key->uuid-key]]
    [konserve.impl.storage-layout :refer [PBackingStore PDataSyncBackingStore -deferred-sync?
@@ -263,6 +263,37 @@
           (recur (+ position read-count) (+ total read-count))))
       total)))
 
+(defn- read-bytes-at!
+  ^bytes [^FileChannel channel position size]
+  (let [buffer (ByteBuffer/allocate (int size))
+        read-size (read-buffer-at! channel buffer position)]
+    (if (= read-size size)
+      (.array buffer)
+      (java.util.Arrays/copyOf (.array buffer) (int read-size)))))
+
+(defn- compressed-binary?
+  "True when the binary's metadata says its payload went through `compressor`
+  (`konserve.impl.defaults/binary-write`). Only an unencrypted payload is."
+  [channel serializer compressor encryptor meta-size header-size]
+  (and (not= compressor null-compressor)
+       (= encryptor null-encryptor)
+       (with-open [in (ByteArrayInputStream. (read-bytes-at! channel header-size meta-size))]
+         (:compressed? (kp/-deserialize (compressor ((encryptor nil) serializer))
+                                        (atom {}) in)))))
+
+(defn- compressed-range
+  "Up to `length` uncompressed bytes from `offset`: decompresses the payload
+  from its start, so the cost follows `offset + length`."
+  ^bytes [channel compressor payload-start payload-size offset length]
+  (with-open [in (decompressing-stream
+                  compressor
+                  (ByteArrayInputStream. (read-bytes-at! channel payload-start payload-size)))]
+    (try
+      (.skipNBytes in offset)
+      (.readNBytes in (int length))
+      (catch java.io.EOFException _
+        (byte-array 0)))))
+
 (defn- read-binary-range*
   [backing store-key serializers offset length]
   (when (neg? offset)
@@ -281,19 +312,17 @@
             (throw (ex-info "Stored binary has an incomplete header."
                             {:store-key store-key
                              :header-bytes header-read})))
-          (let [[_ _ _ _ meta-size actual-header-size]
+          (let [[_ serializer compressor encryptor meta-size actual-header-size]
                 (parse-header (.array header-buffer) serializers)
                 payload-start (+ actual-header-size meta-size)
-                payload-size (max 0 (- (.size channel) payload-start))
-                readable (max 0 (- payload-size offset))
-                read-size (int (min (long length) readable))
-                range-buffer (ByteBuffer/allocate read-size)
-                actual-size (read-buffer-at!
-                             channel range-buffer (+ payload-start offset))
-                range-bytes (.array range-buffer)]
-            (if (= actual-size read-size)
-              range-bytes
-              (java.util.Arrays/copyOf ^bytes range-bytes actual-size)))))
+                payload-size (max 0 (- (.size channel) payload-start))]
+            (if (compressed-binary? channel serializer compressor encryptor
+                                    meta-size actual-header-size)
+              (compressed-range channel compressor payload-start payload-size
+                                offset length)
+              (let [readable (max 0 (- payload-size offset))]
+                (read-bytes-at! channel (+ payload-start offset)
+                                (min (long length) readable)))))))
       (catch NoSuchFileException _
         nil))))
 
