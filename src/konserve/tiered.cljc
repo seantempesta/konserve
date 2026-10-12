@@ -5,9 +5,9 @@
             [clojure.set :as set]
             [konserve.memory :as memory]
             [konserve.protocols :as protocols :refer [-exists? -get-meta -get-in -assoc-in
-                                                      -update-in -dissoc -bget -bassoc
+                                                      -update-in -dissoc -bget -bassoc -bget-range
                                                       -keys -multi-get -multi-assoc -multi-dissoc -assoc-serializers
-                                                      PEDNKeyValueStore PBinaryKeyValueStore
+                                                      PEDNKeyValueStore PBinaryKeyValueStore PBinaryRangeStore
                                                       PKeyIterable PAssocSerializers PMultiKeySupport
                                                       PMultiKeyEDNValueStore]]
             [konserve.utils :refer [meta-update multi-key-capable? kv-keys invoke-write-hooks! #?(:clj async+sync) *default-sync-translation*]
@@ -379,6 +379,17 @@
 
                    :frontend-only
                    (<?- (-bassoc frontend-store key meta-up-fn val opts))))))
+
+  PBinaryRangeStore
+  (-bget-range [_this key offset length opts]
+    (case read-policy
+      :frontend-first
+      (if (-exists? frontend-store key opts)
+        (-bget-range frontend-store key offset length opts)
+        (-bget-range backend-store key offset length opts))
+
+      :frontend-only
+      (-bget-range frontend-store key offset length opts)))
 
   PAssocSerializers
   (-assoc-serializers [this serializers]
