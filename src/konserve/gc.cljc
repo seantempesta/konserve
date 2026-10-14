@@ -12,6 +12,12 @@
   With `:konserve.gc/dry-run? true`, returns the selected logical keys without
   deleting them or invoking deletion callbacks. Selection and batching are identical.
 
+  With `:konserve.gc/report? true`, returns a map containing
+  `:konserve.gc/candidates` (the same selected key set) and
+  `:konserve.gc/observed-keys` (all logical keys observed before deletion).
+  Both come from the same metadata enumeration. Without this option the
+  result remains the selected key set.
+
   The optional `:konserve.gc/batch-issued` callback receives each realized
   vector of encoded physical store-key strings after the batch is fixed and
   before the backing store performs its first existence check or deletion.
@@ -23,7 +29,10 @@
    (sweep! store whitelist ts batch-size {}))
   ([store whitelist ts batch-size opts]
    (go-try-
-    (let [to-delete (->> (<?- (k/keys store))
+    (let [metadata (<?- (k/keys store))
+          observed (when (:konserve.gc/report? opts)
+                     (into #{} (map :key) metadata))
+          to-delete (->> metadata
                          (filter (fn [{:keys [key last-write] :as meta}]
                                    (not
                                     (or (contains? whitelist key)
@@ -32,8 +41,8 @@
                                                         ^Date last-write
                                                         ;; old name
                                                         ^Date (:konserve.core/timestamp meta))))))))
-                         (partition-all batch-size))]
-      (<?-
+                         (partition-all batch-size))
+          candidates (<?-
        (reduce<?-
         (fn [deleted-files batch]
           (go-try-
@@ -56,4 +65,7 @@
                (<?- (async/into [] (async/merge pending-deletes)))
                (into deleted-files (map :key batch)))))))
         #{}
-        to-delete))))))
+        to-delete))]
+      (if (:konserve.gc/report? opts)
+        {:konserve.gc/candidates candidates :konserve.gc/observed-keys observed}
+        candidates)))))

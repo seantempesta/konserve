@@ -90,3 +90,24 @@
                (<!! (gc/sweep! store #{:retained} cutoff 1))))
         (is (= #{:retained} (into #{} (map :key) (<!! (k/keys store))))))
       (finally (delete-store root)))))
+
+(deftest sweep-report-keeps-the-observed-inventory-before-deletion
+  (let [root (str "target/konserve-gc-report/" (random-uuid))]
+    (try
+      (let [store (<!! (connect-fs-store root))
+            opts {:konserve.gc/report? true :konserve.gc/dry-run? true}
+            cutoff (future-date)]
+        (is (= {:konserve.gc/candidates #{} :konserve.gc/observed-keys #{}}
+               (<!! (gc/sweep! store #{} cutoff 1 opts))))
+        (<!! (k/assoc store :retained 1))
+        (<!! (k/assoc store :garbage 2))
+        (is (= {:konserve.gc/candidates #{} :konserve.gc/observed-keys #{:retained :garbage}}
+               (<!! (gc/sweep! store #{} (Date. 0) 1 opts))))
+        (let [report (<!! (gc/sweep! store #{:retained} cutoff 1 opts))]
+          (is (= {:konserve.gc/candidates #{:garbage}
+                  :konserve.gc/observed-keys #{:retained :garbage}} report))
+          (is (= 2 (<!! (k/get store :garbage))))
+          (is (= report (<!! (gc/sweep! store #{:retained} cutoff 1
+                                       {:konserve.gc/report? true}))))
+          (is (= #{:retained} (into #{} (map :key) (<!! (k/keys store)))))))
+      (finally (delete-store root)))))
