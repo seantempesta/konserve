@@ -177,6 +177,13 @@
               (fn [held] (if (some? held) held value))
               opts))
 
+(defn- populates?
+  "Does a backend read copy its value into the frontend? Yes unless the store was
+   connected with `:populate-frontend? false`: an overlay whose frontend holds
+   only its own writes, where a copy of every read would grow without bound."
+  [config]
+  (clojure.core/get config :populate-frontend? true))
+
 (defrecord TieredStore [frontend-store backend-store write-policy read-policy locks config]
   PEDNKeyValueStore
   (-exists? [_this key opts]
@@ -222,7 +229,7 @@
                        (let [backend-result (<?- (-get-in backend-store key-vec ::missing opts))]
                          ;; Populate frontend asynchronously (fire-and-forget), never over a
                          ;; value it holds by then; a nested read is not the key's whole value
-                         (when (and (not= backend-result ::missing) (= 1 (count key-vec)))
+                         (when (and (populates? config) (not= backend-result ::missing) (= 1 (count key-vec)))
                            (go (try
                                  (<?- (warm! frontend-store (first key-vec) backend-result opts))
                                  (invoke-write-hooks! frontend-store {:api-op :assoc-in
@@ -494,7 +501,7 @@
                        ;; Some keys missing from frontend, fetch from backend
                        (let [backend-result (<?- (-multi-get backend-store missing-keys opts))]
                          ;; Populate frontend asynchronously with found backend values (fire-and-forget)
-                         (when (seq backend-result)
+                         (when (and (populates? config) (seq backend-result))
                            (go (try
                                  (doseq [[key value] backend-result]
                                    (<?- (warm! frontend-store key value opts)))
@@ -520,6 +527,9 @@
    Options:
    - :write-policy      #{:write-through :write-behind :write-around} (default :write-through)
    - :read-policy       #{:frontend-first :frontend-only} (default :frontend-first)
+   - :populate-frontend? Whether a :frontend-first read found only in the backend is
+                        copied into the frontend (default true). False keeps the
+                        frontend to this store's own writes (an overlay).
    - :sync?             Boolean for synchronous/asynchronous operation (default false)
 
    Write policies:
