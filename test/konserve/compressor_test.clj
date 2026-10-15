@@ -204,3 +204,82 @@
                                                  {:sync? true}))
             (str k)))
       (finally (delete-store path)))))
+
+;; ---------------------------------------------------------------------------
+;; The frame writer: `Lz4Compressor` encodes a value's frame from its bytes.
+
+(def ^:private raw-serializer
+  "Writes a byte-array value as it is, closing the stream when `close?`."
+  (fn [close?]
+    (reify konserve.protocols/PStoreSerializer
+      (-serialize [_ out _ octets]
+        (.write ^java.io.OutputStream out ^bytes octets)
+        (when close? (.close ^java.io.OutputStream out)))
+      (-deserialize [_ _ in] in))))
+
+(defn- stream-frame
+  "The frame LZ4FrameOutputStream writes for `octets`."
+  ^bytes [^bytes octets close?]
+  (let [bos (ByteArrayOutputStream.)
+        out (LZ4FrameOutputStream. bos LZ4FrameOutputStream$BLOCKSIZE/SIZE_64KB)]
+    (.write out octets)
+    (if close? (.close out) (.flush out))
+    (.toByteArray bos)))
+
+(defn- writer-frame
+  ^bytes [^bytes octets close?]
+  (let [bos (ByteArrayOutputStream.)]
+    (-serialize (lz4-compressor (raw-serializer close?)) bos nil octets)
+    (.toByteArray bos)))
+
+(defn- test-octets
+  "`n` bytes: compressible when `compressible?`, else random; `mixed` makes
+  alternating 64 KiB blocks of each."
+  ^bytes [seed n kind]
+  (let [r (Random. seed) b (byte-array n)]
+    (case kind
+      :random (.nextBytes r b)
+      :compressible (dotimes [i n] (aset b i (unchecked-byte (mod (quot i 7) 13))))
+      :mixed (dotimes [i n] (aset b i (unchecked-byte (if (even? (quot i 65536)) (mod (quot i 7) 13) (.nextInt r 256))))))
+    b))
+
+(deftest lz4-writer-is-byte-identical-to-the-stream
+  (doseq [n [0 1 2 15 16 61 100 1000 4095 65535 65536 65537 131071 131072 131073 200000 300000]
+          kind [:random :compressible :mixed]
+          close? [false true]]
+    (let [octets (test-octets n n kind)]
+      (is (Arrays/equals (stream-frame octets close?) (writer-frame octets close?))
+          (str n " " kind " closed=" close?)))))
+
+(deftest lz4-writer-round-trips-through-every-reader
+  (doseq [n [0 1 61 1000 65536 65537 300000]
+          kind [:random :compressible :mixed]]
+    (let [octets (test-octets 7 n kind)
+          frame (writer-frame octets true)]
+      (is (Arrays/equals octets (.readAllBytes (LZ4FrameInputStream. (ByteArrayInputStream. frame)))))
+      (is (Arrays/equals octets (.readAllBytes (decompressing-stream nil (ByteArrayInputStream. frame)))))
+      (is (Arrays/equals octets (.readAllBytes ^java.io.InputStream
+                                               (-deserialize (lz4-compressor (raw-serializer false)) nil
+                                                             (ByteArrayInputStream. (writer-frame octets false))))))))
+  (let [value {:a (vec (range 5000)) :b "x"}
+        bos (ByteArrayOutputStream.)]
+    (-serialize (lz4-compressor (fressian-serializer)) bos (atom {}) value)
+    (is (= value (-deserialize (lz4-compressor (fressian-serializer)) (atom {})
+                               (ByteArrayInputStream. (.toByteArray bos)))))))
+
+(defn- allocated ^long [f]
+  (let [^com.sun.management.ThreadMXBean mx (ManagementFactory/getThreadMXBean)
+        id (.getId (Thread/currentThread))
+        before (.getThreadAllocatedBytes mx id)]
+    (f)
+    (- (.getThreadAllocatedBytes mx id) before)))
+
+(deftest lz4-write-allocates-in-proportion-to-the-value
+  ;; The stream allocated 2 x 64 KiB per value (~137 KB for a 30-byte value).
+  (let [c (lz4-compressor (fressian-serializer))]
+    (doseq [[value bound] [[{:a 1 :b "hello"} 20000]
+                           [(vec (range 200)) 30000]
+                           [(vec (range 60000)) 3600000]]]
+      (let [w #(-serialize c (ByteArrayOutputStream.) (atom {}) value)]
+        (dotimes [_ 300] (w))
+        (is (< (apply min (repeatedly 20 #(allocated w))) bound))))))

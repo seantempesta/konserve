@@ -32,7 +32,8 @@
 
 #?(:clj
    (def ^:private lz4-codecs
-     (delay {:decompressor (.safeDecompressor (LZ4Factory/fastestInstance))
+     (delay {:compressor (.fastCompressor (LZ4Factory/fastestInstance))
+             :decompressor (.safeDecompressor (LZ4Factory/fastestInstance))
              :xxhash (.hash32 (XXHashFactory/fastestInstance))})))
 
 #?(:clj
@@ -157,22 +158,92 @@
        (frames-content! src dest)
        (ByteArrayInputStream. dest))))
 
+;; Writing a value encodes its LZ4 frame from the serialized bytes, into
+;; arrays sized by the value. LZ4FrameOutputStream allocates a block buffer and
+;; a compressed-block buffer of the frame's block size (2 x 64 KiB) per value,
+;; however small: 96% of what writing a 30-byte value allocated. The bytes are
+;; exactly the stream's: the same descriptor (block independence only, 64 KiB
+;; blocks), the same fast compressor, a block stored uncompressed when it did
+;; not shrink, and an end mark only when the serializer closed the stream (the
+;; stream's flush leaves the frame open).
+
+#?(:clj
+   (def ^:private frame-header
+     "The descriptor `LZ4FrameOutputStream` writes for 64 KiB blocks, block
+     independence only: magic, FLG, BD, descriptor checksum."
+     (let [out (java.io.ByteArrayOutputStream.)]
+       (.flush (LZ4FrameOutputStream. out LZ4FrameOutputStream$BLOCKSIZE/SIZE_64KB))
+       (.toByteArray out))))
+
+#?(:clj
+   (def ^:private block-size 65536))
+
+#?(:clj
+   (defn- write-le-int [^java.io.OutputStream out ^long n]
+     (.write out (int (bit-and n 0xff)))
+     (.write out (int (bit-and (unchecked-int (bit-shift-right n 8)) 0xff)))
+     (.write out (int (bit-and (unchecked-int (bit-shift-right n 16)) 0xff)))
+     (.write out (int (bit-and (unchecked-int (bit-shift-right n 24)) 0xff)))))
+
+#?(:clj
+   (defn- content-stream
+     "An OutputStream collecting the serializer's bytes in one growable array;
+     its `deref` is [array length closed?]."
+     []
+     (let [state (long-array 2)           ; [length closed]
+           buf (volatile! (byte-array 256))
+           room! (fn ^bytes [^long extra]
+                   (let [^bytes b @buf need (+ (aget state 0) extra)]
+                     (if (> need (alength b))
+                       (vreset! buf (java.util.Arrays/copyOf b (int (max need (* 2 (alength b))))))
+                       b)))]
+       (proxy [java.io.OutputStream clojure.lang.IDeref] []
+         (write
+           ([x] (if (bytes? x)
+                  (let [^bytes src x len (alength src) ^bytes b (room! len)]
+                    (System/arraycopy src 0 b (int (aget state 0)) len)
+                    (aset state 0 (+ (aget state 0) len)))
+                  (let [^bytes b (room! 1)]
+                    (aset b (int (aget state 0)) (unchecked-byte (long x)))
+                    (aset state 0 (inc (aget state 0))))))
+           ([^bytes src ^long off ^long len]
+            (let [^bytes b (room! len)]
+              (System/arraycopy src (int off) b (int (aget state 0)) (int len))
+              (aset state 0 (+ (aget state 0) len)))))
+         (close [] (aset state 1 1))
+         (deref [] [@buf (aget state 0) (== 1 (aget state 1))])))))
+
+#?(:clj
+   (defn- write-frame!
+     "Writes the LZ4 frame of the first `n` bytes of `content` to `out`, closed
+     with its end mark when `closed?`."
+     [^java.io.OutputStream out ^bytes content ^long n closed?]
+     (let [           ^net.jpountz.lz4.LZ4Compressor compressor (:compressor @lz4-codecs)
+           scratch (byte-array (.maxCompressedLength compressor (min n block-size)))]
+       (.write out ^bytes frame-header)
+       (loop [off 0]
+         (when (< off n)
+           (let [len (min block-size (- n off))
+                 compressed (.compress compressor content (int off) (int len) scratch 0)]
+             (if (>= compressed len)
+               (do (write-le-int out (bit-or len (unchecked-int 0x80000000)))
+                   (.write out content (int off) (int len)))
+               (do (write-le-int out compressed)
+                   (.write out scratch 0 (int compressed))))
+             (recur (+ off len)))))
+       (when closed? (write-le-int out 0)))))
+
 #?(:clj
    (defrecord Lz4Compressor [serializer]
      PStoreSerializer
      (-deserialize [_ read-handlers bytes]
        (-deserialize serializer read-handlers (frame-content bytes)))
      (-serialize [_ bytes write-handlers val]
-       ;; 64 KiB frame blocks. The stream's default is 4 MiB, and both
-       ;; LZ4FrameOutputStream and the LZ4FrameInputStream that reads the frame
-       ;; back allocate buffers of the frame's block size per value: a few-KB
-       ;; value paid ~70 us to write and ~95 us to read in allocation alone
-       ;; (13x/7x the 64 KiB cost), for the same compressed size. The input
-       ;; stream sizes its buffers from each frame's own descriptor, so frames
-       ;; written with the old block size stay readable.
-       (let [lz4-byte (LZ4FrameOutputStream. bytes LZ4FrameOutputStream$BLOCKSIZE/SIZE_64KB)]
-         (-serialize serializer lz4-byte write-handlers val)
-         (.flush lz4-byte)))))
+       (let [content (content-stream)]
+         (-serialize serializer content write-handlers val)
+         (let [[buf n closed?] @content]
+           (write-frame! bytes buf n closed?)
+           (if closed? (.close ^java.io.OutputStream bytes) (.flush ^java.io.OutputStream bytes)))))))
 
 ;; A binary value has no serializer: its bytes are the value. This identity
 ;; serializer lets a binary payload pass through a store compressor. It closes
