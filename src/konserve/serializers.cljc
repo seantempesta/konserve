@@ -3,7 +3,10 @@
             #?(:clj [clojure.data.fressian :as fress] :cljs [fress.api :as fress])
             [konserve.protocols :refer [PStoreSerializer]]
             [incognito.fressian :refer [incognito-read-handlers incognito-write-handlers]]
-            [incognito.edn :refer [read-string-safe]]))
+            [incognito.edn :refer [read-string-safe]])
+  #?(:clj (:import [java.io InputStream]
+                   [org.fressian FressianReader]
+                   [org.fressian.handlers ILookup])))
 
 #?(:clj
    (defrecord CBORSerializer [codec]
@@ -32,12 +35,18 @@
              (-namespace [_] "konserve.serializers")))
   PStoreSerializer
   (-deserialize [_ read-handlers bytes]
-    (let [handlers #?(:cljs (merge custom-read-handlers (incognito-read-handlers read-handlers))
-                      :clj (-> (merge fress/clojure-read-handlers
-                                      custom-read-handlers
-                                      (incognito-read-handlers read-handlers))
-                               fress/associative-lookup))]
-      (fress/read bytes :handlers handlers)))
+    #?(:cljs (fress/read bytes :handlers (merge custom-read-handlers (incognito-read-handlers read-handlers)))
+       ;; The handler a tag names is the one `(merge clojure custom incognito)`
+       ;; would hold, looked up in each map instead of merged per read. The
+       ;; reader takes the stream as it is: `fress/read` would wrap it in a
+       ;; BufferedInputStream with an 8 KiB buffer.
+       :clj (let [incognito (incognito-read-handlers read-handlers)
+                  lookup (reify ILookup
+                           (valAt [_ tag]
+                             (or (get incognito tag)
+                                 (get custom-read-handlers tag)
+                                 (get fress/clojure-read-handlers tag))))]
+              (.readObject (FressianReader. ^InputStream bytes lookup false)))))
   (-serialize [_ #?(:clj bytes :cljs _) write-handlers val]
     (let [handlers #?(:clj (-> (merge
                                 fress/clojure-write-handlers

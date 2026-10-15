@@ -3,7 +3,9 @@
   (:require
    [clojure.core.async :refer [<! timeout] :as async]
    [clojure.string :refer [ends-with?]]
-   [hasch.core :refer [uuid]]
+   #?@(:clj [[hasch.benc :refer [-coerce digest]]
+             [hasch.platform :refer [sha512-message-digest uuid5]]]
+       :cljs [[hasch.core :refer [uuid]]])
    [konserve.serializers :refer [key->serializer]]
    [konserve.compressor :refer [get-compressor null-compressor
                                 #?@(:clj [compress-octets decompressing-stream])]]
@@ -45,8 +47,14 @@
   (-release [_this env]
     (if (:sync? env) nil (go-try- nil))))
 
-(defn key->store-key [key]
-  (str (uuid key) ".ksv"))
+(defn key->store-key
+  "The file name of `key`: its `hasch.core/uuid`. On the JVM the uuid is made
+  from the digest bytes, without the seq of unsigned longs `hasch.core/edn-hash`
+  builds and `hasch.platform/uuid5` turns back into bytes."
+  [key]
+  (str #?(:clj (uuid5 (digest (-coerce key sha512-message-digest {}) sha512-message-digest))
+          :cljs (uuid key))
+       ".ksv"))
 
 (defn store-key->uuid-key [^String store-key]
   (cond
