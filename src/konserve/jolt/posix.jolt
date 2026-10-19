@@ -1,0 +1,187 @@
+(ns konserve.jolt.posix
+  "Thin POSIX file primitives over jolt.ffi (macOS/arm64 and Linux constants).
+  Every call that can fail captures errno atomically and throws an ex-info with
+  :errno and :op; ENOENT is reported as :type :enoent so callers can branch."
+  (:require [jolt.ffi :as ffi]))
+
+(ffi/load-library)
+
+(def darwin? (.startsWith ^String (System/getProperty "os.name" "") "Mac"))
+
+;; <fcntl.h> / <sys/file.h>
+(def O_RDONLY 0)
+(def O_WRONLY 1)
+(def O_RDWR 2)
+(def O_CREAT (if darwin? 0x200 0x40))
+(def O_TRUNC (if darwin? 0x400 0x200))
+(def O_EXCL (if darwin? 0x800 0x80))
+(def O_CLOEXEC (if darwin? 0x1000000 0x80000))
+(def F_SETLK (if darwin? 8 6))
+(def F_SETLKW (if darwin? 9 7))
+(def F_RDLCK (if darwin? 1 0))
+(def F_UNLCK 2)
+(def F_WRLCK (if darwin? 3 1))
+(def F_FULLFSYNC 51)
+(def SEEK_END 2)
+(def ENOENT 2)
+(def EINTR 4)
+(def EEXIST 17)
+
+(ffi/defcfn c-open "open" [:string :int :& :int] :int {:capture-native-error true})
+(ffi/defcfn c-close "close" [:int] :int {:capture-native-error true})
+(ffi/defcfn c-pread "pread" [:int :pointer :size_t :int64] :ssize_t {:capture-native-error true :blocking true})
+(ffi/defcfn c-pwrite "pwrite" [:int :pointer :size_t :int64] :ssize_t {:capture-native-error true :blocking true})
+(ffi/defcfn c-fsync "fsync" [:int] :int {:capture-native-error true :blocking true})
+(ffi/defcfn c-fcntl-int "fcntl" [:int :int :& :int] :int {:capture-native-error true})
+(ffi/defcfn c-fcntl-ptr "fcntl" [:int :int :& :pointer] :int {:capture-native-error true})
+(ffi/defcfn c-lseek "lseek" [:int :int64 :int] :int64 {:capture-native-error true})
+(ffi/defcfn c-rename "rename" [:string :string] :int {:capture-native-error true})
+(ffi/defcfn c-unlink "unlink" [:string] :int {:capture-native-error true})
+(ffi/defcfn c-rmdir "rmdir" [:string] :int {:capture-native-error true})
+(ffi/defcfn c-mkdir "mkdir" [:string :int] :int {:capture-native-error true})
+(ffi/defcfn c-access "access" [:string :int] :int)
+(ffi/defcfn c-opendir "opendir" [:string] :pointer {:capture-native-error true})
+(ffi/defcfn c-readdir "readdir" [:pointer] :pointer)
+(ffi/defcfn c-closedir "closedir" [:pointer] :int)
+
+(defn- fail! [op errno data]
+  (throw (ex-info (str "posix " op " failed: " (ffi/errno-message errno))
+                  (merge {:op op :errno errno
+                          :type (if (= errno ENOENT) :enoent :posix-error)}
+                         data))))
+
+(defn- check [op [r errno] data]
+  (if (neg? r) (fail! op errno data) r))
+
+(defn open-file
+  "fd for path, opened with flags (and mode when creating)."
+  ([path flags] (check "open" (c-open path (bit-or flags O_CLOEXEC) 0644) {:path path}))
+  ([path flags mode] (check "open" (c-open path (bit-or flags O_CLOEXEC) mode) {:path path})))
+
+(defn close-fd [fd] (check "close" (c-close fd) {:fd fd}) nil)
+
+(defn file-size [fd] (check "lseek" (c-lseek fd 0 SEEK_END) {:fd fd}))
+
+(defn pread-bytes
+  "Read up to n bytes at offset; answers a byte-array of the bytes read."
+  ^bytes [fd n offset]
+  (if (zero? n)
+    (byte-array 0)
+    (let [buf (ffi/alloc n)]
+      (try
+        (loop [got 0]
+          (if (< got n)
+            (let [[r e] (c-pread fd (+ buf got) (- n got) (+ offset got))]
+              (cond
+                (and (neg? r) (= e EINTR)) (recur got)
+                (neg? r) (fail! "pread" e {:fd fd})
+                (zero? r) (ffi/read-array buf got)
+                :else (recur (+ got r))))
+            (ffi/read-array buf n)))
+        (finally (ffi/free buf))))))
+
+(defn pwrite-bytes
+  "Write all of arr at offset."
+  [fd ^bytes arr offset]
+  (let [n (alength arr)]
+    (when (pos? n)
+      (let [buf (ffi/alloc n)]
+        (try
+          (ffi/write-array buf arr)
+          (loop [put 0]
+            (when (< put n)
+              (let [[r e] (c-pwrite fd (+ buf put) (- n put) (+ offset put))]
+                (cond
+                  (and (neg? r) (= e EINTR)) (recur put)
+                  (neg? r) (fail! "pwrite" e {:fd fd})
+                  :else (recur (+ put r))))))
+          (finally (ffi/free buf)))))
+    n))
+
+(defn full-sync
+  "Durable flush: F_FULLFSYNC on macOS (what the JDK's FileChannel.force does
+  there), fsync(2) elsewhere."
+  [fd]
+  (if darwin?
+    (check "fcntl(F_FULLFSYNC)" (c-fcntl-int fd F_FULLFSYNC 0) {:fd fd})
+    (check "fsync" (c-fsync fd) {:fd fd}))
+  nil)
+
+(defn data-sync
+  "fsync(2): hands the data to the drive (not a drive-cache flush on macOS)."
+  [fd]
+  (check "fsync" (c-fsync fd) {:fd fd})
+  nil)
+
+;; struct flock: darwin {off_t l_start; off_t l_len; pid_t l_pid; short l_type; short l_whence}
+;;               linux  {short l_type; short l_whence; off_t l_start; off_t l_len; pid_t l_pid}
+(def ^:private flock-layout
+  (if darwin?
+    (ffi/layout [:struct [[:l_start :int64] [:l_len :int64] [:l_pid :int32]
+                          [:l_type :int16] [:l_whence :int16]]])
+    (ffi/layout [:struct [[:l_type :int16] [:l_whence :int16] [:l_start :int64]
+                          [:l_len :int64] [:l_pid :int32]]])))
+
+(defn- fcntl-lock [fd cmd type]
+  (with-open [a (ffi/confined-arena)]
+    (let [p (ffi/alloc a flock-layout)]
+      (ffi/write p flock-layout {:l_start 0 :l_len 0 :l_pid 0 :l_type type :l_whence 0})
+      (c-fcntl-ptr fd cmd p))))
+
+(defn lock-exclusive
+  "Whole-file POSIX record lock (F_SETLKW F_WRLCK), the lock the JDK's
+  FileChannel.lock() takes, so JVM and Jolt processes exclude each other."
+  [fd]
+  (loop []
+    (let [[r e] (fcntl-lock fd F_SETLKW F_WRLCK)]
+      (cond (and (neg? r) (= e EINTR)) (recur)
+            (neg? r) (fail! "fcntl(F_SETLKW)" e {:fd fd})
+            :else true))))
+
+(defn unlock [fd]
+  (check "fcntl(F_UNLCK)" (fcntl-lock fd F_SETLK F_UNLCK) {:fd fd})
+  nil)
+
+(defn rename! [from to] (check "rename" (c-rename from to) {:from from :to to}) nil)
+(defn unlink! [path] (check "unlink" (c-unlink path) {:path path}) nil)
+(defn rmdir! [path] (check "rmdir" (c-rmdir path) {:path path}) nil)
+(defn exists? [path] (zero? (c-access path 0)))
+
+(defn mkdirs!
+  "mkdir -p."
+  [path]
+  (let [parts (remove empty? (.split ^String path "/"))
+        abs? (.startsWith ^String path "/")]
+    (reduce (fn [acc part]
+              (let [p (if (or abs? (seq acc)) (str acc "/" part) part)]
+                (let [[r e] (c-mkdir p 0755)]
+                  (when (and (neg? r) (not= e EEXIST)) (fail! "mkdir" e {:path p})))
+                p))
+            "" parts)
+    nil))
+
+(def ^:private dirent-namlen-off (if darwin? 18 16))
+(def ^:private dirent-name-off (if darwin? 21 19))
+
+(defn list-dir
+  "Names in directory path, without . and .."
+  [path]
+  (let [[d e] (c-opendir path)]
+    (when (ffi/null? d) (fail! "opendir" e {:path path}))
+    (try
+      (loop [acc (transient [])]
+        (let [ent (c-readdir d)]
+          (if (ffi/null? ent)
+            (persistent! acc)
+            (let [name (if darwin?
+                         (let [n (ffi/read ent :uint16 dirent-namlen-off)]
+                           (String. ^bytes (ffi/read-array (+ ent dirent-name-off) n) "UTF-8"))
+                         (ffi/ptr->string (+ ent dirent-name-off)))]
+              (recur (if (or (= name ".") (= name "..")) acc (conj! acc name)))))))
+      (finally (c-closedir d)))))
+
+(defn sync-dir
+  "Durably flush a directory's entries (after a rename)."
+  [path]
+  (let [fd (open-file path O_RDONLY)]
+    (try (full-sync fd) (finally (close-fd fd)))))

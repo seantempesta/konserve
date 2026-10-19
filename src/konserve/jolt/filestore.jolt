@@ -1,0 +1,168 @@
+(ns konserve.jolt.filestore
+  "konserve's file store for Jolt: the same on-disk layout as
+  konserve.filestore (one `<uuid>.ksv` file per key: 20-byte header, metadata,
+  value; writes go to `<uuid>.ksv.new`, are flushed and renamed over the key),
+  implemented over POSIX calls through jolt.ffi instead of java.nio channels.
+
+  Locks are whole-file fcntl record locks, the lock the JDK's FileChannel.lock()
+  takes, so a JVM filestore and a Jolt filestore on one directory exclude each
+  other. Like any fcntl lock they do not exclude threads of one process."
+  (:require [clojure.core.async :refer [go]]
+            [konserve.impl.defaults :refer [connect-default-store]]
+            [konserve.impl.storage-layout :as sl
+             :refer [PBackingStore PBackingBlob PBackingLock PDataSyncBackingStore
+                     PBackingBinaryRangeStore header-size parse-header]]
+            [konserve.compressor :refer [null-compressor]]
+            [konserve.encryptor :refer [null-encryptor]]
+            [konserve.jolt.posix :as p]
+            [superv.async :refer [go-try-]])
+  (:import [java.io ByteArrayInputStream]))
+
+(defmacro ^:private sync-or-go
+  "Run body now when (:sync? env), else on a go block whose channel carries the
+  value or the exception (superv.async's convention)."
+  [env & body]
+  `(if (:sync? ~env)
+     (do ~@body)
+     (go-try- ~@body)))
+
+(defrecord PosixLock [fd]
+  PBackingLock
+  (-release [_ env] (sync-or-go env (p/unlock fd) nil)))
+
+(defn- input->bytes ^bytes [input]
+  (cond
+    (bytes? input) input
+    (string? input) (.getBytes ^String input "UTF-8")
+    (instance? java.io.File input) (let [fd (p/open-file (.getPath ^java.io.File input) p/O_RDONLY)]
+                                     (try (p/pread-bytes fd (p/file-size fd) 0)
+                                          (finally (p/close-fd fd))))
+    (instance? java.io.InputStream input) (.readAllBytes ^java.io.InputStream input)
+    :else (throw (ex-info "Unsupported binary input." {:type (type input)}))))
+
+(deftype PosixBlob [fd path ^:unsynchronized-mutable closed?]
+  PBackingBlob
+  (-sync [_ env] (sync-or-go env (p/full-sync fd)))
+  (-close [this env]
+    (sync-or-go env
+                (when-not closed?
+                  (set! closed? true)
+                  (p/close-fd fd))
+                nil))
+  (-get-lock [_ env] (sync-or-go env (p/lock-exclusive fd) (->PosixLock fd)))
+  (-read-header [_ env]
+    (sync-or-go env
+                (let [arr (p/pread-bytes fd header-size 0)
+                      len (alength arr)]
+                  (when (zero? len)
+                    (throw (ex-info "File is empty or deleted during read"
+                                    {:length len :expected [20 8] :path path})))
+                  (when-not (or (= 20 len) (= 8 len))
+                    (throw (ex-info "Header size mismatch" {:expected [20 8] :actual len})))
+                  arr)))
+  (-read-meta [_ meta-size env]
+    (sync-or-go env (p/pread-bytes fd meta-size (:header-size env))))
+  (-read-value [_ meta-size env]
+    (sync-or-go env
+                (let [start (+ (:header-size env) meta-size)]
+                  (p/pread-bytes fd (- (p/file-size fd) start) start))))
+  (-read-binary [_ meta-size locked-cb env]
+    (let [read (fn []
+                 (let [total (p/file-size fd)
+                       start (+ (:header-size env) meta-size)]
+                   {:input-stream (ByteArrayInputStream. (p/pread-bytes fd (- total start) start))
+                    :size total}))]
+      (if (:sync? env)
+        (locked-cb (read))
+        (go-try- (superv.async/<?- (locked-cb (read)))))))
+  (-write-header [_ header env] (sync-or-go env (p/pwrite-bytes fd header 0)))
+  (-write-meta [_ meta-arr env] (sync-or-go env (p/pwrite-bytes fd meta-arr header-size)))
+  (-write-value [_ value-arr meta-size env]
+    (sync-or-go env (p/pwrite-bytes fd value-arr (+ header-size meta-size))))
+  (-write-binary [_ meta-size blob env]
+    (sync-or-go env (p/pwrite-bytes fd (input->bytes blob) (+ header-size meta-size)))))
+
+(defn- path-of [base store-key] (str base "/" store-key))
+
+(defn- ephemeral? [name] (.startsWith ^String name ".nfs"))
+
+(defn delete-store
+  "Delete every file in base, then base itself, and flush the parent."
+  [base]
+  (when (p/exists? base)
+    (doseq [c (p/list-dir base)] (p/unlink! (path-of base c)))
+    (p/rmdir! base)
+    (let [i (.lastIndexOf ^String base "/")]
+      (when (pos? i) (p/sync-dir (subs base 0 i))))))
+
+(defn- read-range [base store-key serializers offset length]
+  (let [path (path-of base store-key)]
+    (when (p/exists? path)
+      (let [fd (p/open-file path p/O_RDONLY)]
+        (try
+          (let [[_ _serializer compressor encryptor meta-size hsize]
+                (parse-header (p/pread-bytes fd header-size 0) serializers)
+                start (+ hsize meta-size)
+                size (max 0 (- (p/file-size fd) start))]
+            (when-not (and (= compressor null-compressor) (= encryptor null-encryptor))
+              (throw (ex-info "Range reads of compressed or encrypted binaries are not supported on Jolt."
+                              {:store-key store-key})))
+            (p/pread-bytes fd (min length (max 0 (- size offset))) (+ start offset)))
+          (finally (p/close-fd fd)))))))
+
+(defrecord BackingPosixFilestore [base]
+  PBackingStore
+  (-create-blob [_ store-key env]
+    (let [path (path-of base store-key)]
+      (sync-or-go env (->PosixBlob (p/open-file path (bit-or p/O_RDWR p/O_CREAT)) path false))))
+  (-delete-blob [_ store-key env] (sync-or-go env (p/unlink! (path-of base store-key))))
+  (-blob-exists? [_ store-key env] (sync-or-go env (p/exists? (path-of base store-key))))
+  (-migratable [_ _key _store-key env] (sync-or-go env false))
+  (-migrate [_ _ _ _ _ _ env] (sync-or-go env false))
+  (-handle-foreign-key [_ _ _ _ _ env] (sync-or-go env []))
+  (-keys [_ env] (sync-or-go env (into [] (remove ephemeral?) (p/list-dir base))))
+  (-copy [_ from to env]
+    (sync-or-go env
+                (let [src (p/open-file (path-of base from) p/O_RDONLY)
+                      bs (try (p/pread-bytes src (p/file-size src) 0) (finally (p/close-fd src)))
+                      dst (p/open-file (path-of base to) (bit-or p/O_WRONLY p/O_CREAT p/O_TRUNC))]
+                  (try (p/pwrite-bytes dst bs 0) (finally (p/close-fd dst))))))
+  (-atomic-move [_ from to env]
+    (sync-or-go env (p/rename! (path-of base from) (path-of base to))))
+  (-create-store [_ env]
+    (sync-or-go env
+                (p/mkdirs! base)
+                (let [probe (path-of base (str (random-uuid)))]
+                  (p/close-fd (p/open-file probe (bit-or p/O_RDWR p/O_CREAT p/O_EXCL)))
+                  (p/unlink! probe))))
+  (-delete-store [_ env] (sync-or-go env (delete-store base)))
+  (-store-exists? [_ env] (sync-or-go env (p/exists? base)))
+  (-sync-store [_ env] (sync-or-go env (p/sync-dir base)))
+
+  PDataSyncBackingStore
+  (-deferred-sync? [_] p/darwin?)
+  (-sync-data [_ store-key env]
+    (sync-or-go env
+                (let [fd (p/open-file (path-of base store-key) p/O_RDONLY)]
+                  (try (p/data-sync fd) (finally (p/close-fd fd))))))
+
+  PBackingBinaryRangeStore
+  (-read-binary-range [_ store-key serializers offset length _env]
+    (read-range base store-key serializers offset length)))
+
+(defn connect-fs-store
+  "A konserve store in directory `path`, layout-compatible with
+  konserve.filestore/connect-fs-store. Same options; the default serializer is
+  :StringSerializer here because Fressian is JVM-only."
+  [path & {:keys [config] :as params}]
+  (let [store-config (merge {:default-serializer :StringSerializer
+                             :compressor null-compressor
+                             :encryptor null-encryptor
+                             :read-handlers (atom {})
+                             :write-handlers (atom {})
+                             :buffer-size (* 1024 1024)
+                             :opts {:sync? false}
+                             :config (merge {:sync-blob? true :in-place? false :lock-blob? true}
+                                            config)}
+                            (dissoc params :config))]
+    (connect-default-store (->BackingPosixFilestore path) store-config)))
