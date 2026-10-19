@@ -94,7 +94,10 @@
 (defn- unlocked-chan
   "A fresh channel preloaded with one :unlocked semaphore token."
   []
-  (let [c (chan)]
+  ;; Buffered so the token sits in the buffer: Jolt's core.async `poll!` does
+  ;; not take a pending put from an unbuffered channel (JVM core.async does),
+  ;; and `wait` then sleeps 0-19 ms per sync operation.
+  (let [c (chan 1)]
     (put! c :unlocked)
     c))
 
