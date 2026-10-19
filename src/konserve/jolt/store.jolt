@@ -1,0 +1,60 @@
+(ns konserve.jolt.store
+  "Registers the Jolt backends with konserve.store's dispatch: requiring this
+  namespace makes {:backend :file :path ..} use konserve.jolt.filestore (the
+  JVM :file methods need java.nio channels Jolt does not have) and adds
+  {:backend :lmdb :path ..} over konserve.jolt.lmdb."
+  (:require [konserve.store :as ks]
+            [konserve.jolt.filestore :as jfs]
+            [konserve.jolt.lmdb :as lmdb]
+            [konserve.jolt.posix :as p]
+            [superv.async :refer [go-try-]]))
+
+(defn- answer [opts v] (if (:sync? opts) v (go-try- v)))
+
+(defn- store-opts [config opts]
+  (cond-> {:opts opts}
+    (:config config) (assoc :config (:config config))
+    (:default-serializer config) (assoc :default-serializer (:default-serializer config))))
+
+;; ----- :file -----
+
+(defmethod ks/-connect-store :file [{:keys [path] :as config} opts]
+  (when-not (p/exists? path)
+    (throw (ex-info (str "File store does not exist at path: " path) {:path path :config config})))
+  (apply jfs/connect-fs-store path (mapcat identity (store-opts config opts))))
+
+(defmethod ks/-create-store :file [{:keys [path] :as config} opts]
+  (when (p/exists? path)
+    (throw (ex-info (str "File store already exists at path: " path) {:path path :config config})))
+  (apply jfs/connect-fs-store path (mapcat identity (store-opts config opts))))
+
+(defmethod ks/-store-exists? :file [{:keys [path]} opts] (answer opts (p/exists? path)))
+
+(defmethod ks/-delete-store :file [{:keys [path]} opts] (answer opts (jfs/delete-store path)))
+
+(defmethod ks/-release-store :file [_ _ opts] (answer opts nil))
+
+;; ----- :lmdb -----
+
+(defn- lmdb-opts [config opts]
+  (cond-> (store-opts config opts)
+    (:lmdb config) (assoc :lmdb (:lmdb config))))
+
+(defmethod ks/-connect-store :lmdb [{:keys [path] :as config} opts]
+  (when-not (p/exists? (str path "/data.mdb"))
+    (throw (ex-info (str "LMDB store does not exist at path: " path) {:path path :config config})))
+  (apply lmdb/connect-lmdb-store path (mapcat identity (lmdb-opts config opts))))
+
+(defmethod ks/-create-store :lmdb [{:keys [path] :as config} opts]
+  (when (p/exists? (str path "/data.mdb"))
+    (throw (ex-info (str "LMDB store already exists at path: " path) {:path path :config config})))
+  (apply lmdb/connect-lmdb-store path (mapcat identity (lmdb-opts config opts))))
+
+(defmethod ks/-store-exists? :lmdb [{:keys [path]} opts]
+  (answer opts (p/exists? (str path "/data.mdb"))))
+
+(defmethod ks/-delete-store :lmdb [{:keys [path]} opts]
+  (lmdb/close-env! path)
+  (answer opts (jfs/delete-store path)))
+
+(defmethod ks/-release-store :lmdb [_ _ opts] (answer opts nil))
