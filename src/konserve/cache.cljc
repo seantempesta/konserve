@@ -1,0 +1,202 @@
+(ns konserve.cache
+  "Provides core functions, but with additional caching. Still subject to internal
+  changes. Use this namespace only if you anticipate to be the only process
+  accessing the store, otherwise you should implement your own caching strategy."
+  (:refer-clojure :exclude [assoc-in assoc exists? dissoc get get-in
+                            keys update-in update])
+  (:require [konserve.protocols :refer [-get-in -assoc-in
+                                        -update-in -dissoc]]
+            #?(:clj [clojure.core.cache :as cache]
+               :cljs [cljs.cache :as cache])
+            [konserve.core #?@(:clj (:refer [go-locked locked])) :as core]
+            [konserve.utils :refer [meta-update invoke-write-hooks! #?(:clj async+sync) *default-sync-translation*]
+             #?@(:cljs [:refer-macros [async+sync]])]
+            [replikativ.logging :as log]
+            [superv.async :refer [go-try- <?-]]
+            [clojure.core.async])
+  #?(:cljs (:require-macros [konserve.core :refer [go-locked locked]])))
+
+(defn ensure-cache
+  "Adds a cache to the store. If none is provided it takes a LRU cache with 32
+  elements per default."
+  ([store]
+   (ensure-cache store (atom (cache/lru-cache-factory {} :threshold 32))))
+  ([store cache]
+   (clojure.core/assoc store :cache cache)))
+
+(defn- read-through [store key opts]
+  (async+sync
+   (:sync? opts)
+   *default-sync-translation*
+   (go-try-
+    (let [cache         (:cache store)]
+      (if (cache/has? @cache key)
+        (let [v (cache/lookup @cache key)]
+          (swap! cache cache/hit key)
+          v)
+        (let [v (<?- (-get-in store [key] ::missing opts))]
+          (swap! cache cache/miss key v)
+          v))))))
+
+(defn exists?
+  "Checks whether value is in the store."
+  ([store key]
+   (exists? store key {:sync? false}))
+  ([store key opts]
+   (log/trace :konserve/cache-exists? {:key key})
+   (async+sync (:sync? opts)
+               *default-sync-translation*
+               (go-locked
+                store key
+                (let [v (<?- (read-through store key opts))]
+                  (not= v ::missing))))))
+
+(defn get-in
+  "Returns the value stored described by key-vec or nil if the path is
+  not resolvable."
+  ([store key-vec]
+   (get-in store key-vec nil))
+  ([store key-vec not-found]
+   (get-in store key-vec not-found {:sync? false}))
+  ([store key-vec not-found opts]
+   (log/trace :konserve/cache-get-in {:key-vec key-vec})
+   (async+sync (:sync? opts)
+               *default-sync-translation*
+               (go-locked
+                store (first key-vec)
+                (let [[fkey & rkey] key-vec
+                      v (<?- (read-through store fkey opts))]
+                  (if (not= v ::missing)
+                    (clojure.core/get-in v rkey not-found)
+                    not-found))))))
+
+(defn get
+  "Returns the value stored described by key. Returns nil if the key
+   is not present, or the not-found value if supplied."
+  ([store key]
+   (get store key nil))
+  ([store key not-found]
+   (get store key not-found {:sync? false}))
+  ([store key not-found opts]
+   (log/trace :konserve/cache-get {:key key})
+   (get-in store [key] not-found opts)))
+
+(defn update-in
+  "Updates a position described by key-vec by applying up-fn and storing
+  the result atomically. Returns a vector [old new] of the previous
+  value and the result of applying up-fn (the newly stored value)."
+  ([store key-vec up-fn]
+   (update-in store key-vec up-fn {:sync? false}))
+  ([store key-vec up-fn opts]
+   (log/trace :konserve/cache-update-in {:key-vec key-vec})
+   (async+sync (:sync? opts)
+               *default-sync-translation*
+               (go-locked
+                store (first key-vec)
+                (let [cache (:cache store)
+                      key (first key-vec)
+                      [old-val new-val] (<?- (-update-in store key-vec (partial meta-update (first key-vec) :edn) up-fn opts))
+                      had-key? (cache/has? @cache key)]
+                  (swap! cache cache/evict key)
+                  (when had-key?
+                    (swap! cache cache/miss key new-val))
+                  (invoke-write-hooks! store {:api-op :update-in
+                                              :key key
+                                              :key-vec key-vec
+                                              :old-value old-val
+                                              :value new-val})
+                  [old-val new-val])))))
+
+#_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
+(defn update
+  "Updates a position described by key by applying up-fn and storing
+  the result atomically. Returns a vector [old new] of the previous
+  value and the result of applying up-fn (the newly stored value)."
+  ([store key fn]
+   (update store key fn {:sync? false}))
+  ([store key fn opts]
+   (log/trace :konserve/cache-update {:key key})
+   (update-in store [key] fn opts)))
+
+(defn assoc-in
+  "Associates the key-vec to the value, any missing collections for
+  the key-vec (nested maps and vectors) are newly created."
+  ([store key-vec val]
+   (assoc-in store key-vec val {:sync? false}))
+  ([store key-vec val opts]
+   (log/trace :konserve/cache-assoc-in {:key-vec key-vec})
+   (async+sync (:sync? opts)
+               *default-sync-translation*
+               (go-locked
+                store (first key-vec)
+                (let [cache (:cache store)
+                      key (first key-vec)
+                      [old-val new-val] (<?- (-assoc-in store key-vec (partial meta-update key :edn) val opts))
+                      had-key? (cache/has? @cache key)]
+                  (swap! cache cache/evict key)
+                  (when had-key?
+                    (swap! cache cache/miss key new-val))
+                  (invoke-write-hooks! store {:api-op :assoc-in
+                                              :key key
+                                              :key-vec key-vec
+                                              :value val})
+                  [old-val new-val])))))
+
+(defn assoc
+  "Associates the key to the value. This is a simple top-level overwrite."
+  ([store key val]
+   (assoc store key val {:sync? false}))
+  ([store key val opts]
+   (log/trace :konserve/cache-assoc {:key key})
+   (async+sync (:sync? opts)
+               *default-sync-translation*
+               (go-locked
+                store key
+                ;; Mirror konserve.core/assoc — fire :api-op :assoc, not the
+                ;; :assoc-in we'd inherit by delegating to assoc-in — so hook
+                ;; consumers see the same op label as the non-cache API.
+                (let [cache (:cache store)
+                      [old-val new-val] (<?- (-assoc-in store [key] (partial meta-update key :edn) val opts))
+                      had-key? (cache/has? @cache key)]
+                  (swap! cache cache/evict key)
+                  (when had-key?
+                    (swap! cache cache/miss key new-val))
+                  (invoke-write-hooks! store {:api-op :assoc
+                                              :key key
+                                              :value val})
+                  [old-val new-val])))))
+
+(defn dissoc
+  "Removes an entry from the store. "
+  ([store key]
+   (dissoc store key {:sync? false}))
+  ([store key opts]
+   (log/trace :konserve/cache-dissoc {:key key})
+   (async+sync (:sync? opts)
+               *default-sync-translation*
+               (go-locked
+                store key
+                (let [cache (:cache store)
+                      result (<?- (-dissoc store key opts))]
+                  (swap! cache cache/evict key)
+                  ;; Match konserve.core/dissoc: only fire the hook when a
+                  ;; value was actually removed (-dissoc returns false for an
+                  ;; absent key). Otherwise a no-op delete would emit a
+                  ;; spurious hook and konserve-sync would replicate a phantom
+                  ;; deletion.
+                  (when result
+                    (invoke-write-hooks! store {:api-op :dissoc
+                                                :key key}))
+                  result)))))
+
+;; alias core functions without caching for convenience
+#_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
+(def append core/append)
+#_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
+(def log core/log)
+#_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
+(def reduce-log core/reduce-log)
+
+(def bassoc core/bassoc)
+(def bget core/bget)
+(def keys core/keys)

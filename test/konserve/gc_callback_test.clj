@@ -1,0 +1,113 @@
+(ns konserve.gc-callback-test
+  (:require [clojure.core.async :refer [<!!]]
+            [clojure.string :as string]
+            [clojure.test :refer [deftest is testing]]
+            [konserve.core :as k]
+            [konserve.filestore :refer [connect-fs-store delete-store]]
+            [konserve.gc :as gc]
+            [konserve.impl.defaults :as defaults])
+  (:import [java.nio.file Files Path Paths]
+           [java.util Date]))
+
+(defn- store-path
+  [root store-key]
+  (.resolve ^Path (Paths/get root (make-array String 0)) ^String store-key))
+
+(defn- future-date
+  []
+  (Date. (+ (System/currentTimeMillis) 60000)))
+
+(deftest sweep-reports-each-fixed-physical-batch-before-deletion
+  (let [root (str "target/konserve-gc-callback-test/" (random-uuid))
+        keys [:first :second :third]
+        expected-store-keys (set (map defaults/key->store-key keys))
+        issued-batches (atom [])]
+    (try
+      (let [store (<!! (connect-fs-store root))]
+        (doseq [key keys]
+          (<!! (k/assoc store key {:value key})))
+        (is (= (set keys)
+               (<!! (gc/sweep!
+                     store
+                     #{}
+                     (future-date)
+                     2
+                     {:konserve.gc/batch-issued
+                      (fn [store-keys]
+                        (testing "the complete encoded batch exists before deletion starts"
+                          (is (vector? store-keys))
+                          (is (every? #(string/ends-with? % ".ksv") store-keys))
+                          (is (every? #(Files/exists (store-path root %)
+                                                     (make-array java.nio.file.LinkOption 0))
+                                      store-keys)))
+                        (swap! issued-batches conj store-keys))}))))
+        (is (= [1 2] (sort (mapv count @issued-batches))))
+        (is (= expected-store-keys (set (mapcat identity @issued-batches)))))
+      (finally
+        (delete-store root)))))
+
+(deftest callback-failure-precedes-any-delete-from-its-batch
+  (let [root (str "target/konserve-gc-callback-failure-test/" (random-uuid))
+        keys [:left :right]
+        expected-store-keys (mapv defaults/key->store-key keys)]
+    (try
+      (let [store (<!! (connect-fs-store root))
+            refusal (ex-info "test callback refusal" {:test/refused? true})]
+        (doseq [key keys]
+          (<!! (k/assoc store key {:value key})))
+        (let [result (<!! (gc/sweep!
+                           store
+                           #{}
+                           (future-date)
+                           2
+                           {:konserve.gc/batch-issued
+                            (fn [_store-keys]
+                              (throw refusal))}))]
+          (is (instance? Throwable result))
+          (is (= {:test/refused? true} (ex-data result)))
+          (is (every? #(Files/exists (store-path root %)
+                                     (make-array java.nio.file.LinkOption 0))
+                      expected-store-keys))))
+      (finally
+        (delete-store root)))))
+
+(deftest dry-run-selects-the-sweep-keys-without-deleting
+  (let [root (str "target/konserve-gc-dry-run/" (random-uuid))]
+    (try
+      (let [store (<!! (connect-fs-store root))
+            cutoff (future-date)
+            opts {:konserve.gc/dry-run? true
+                  :konserve.gc/batch-issued (fn [_] (throw (ex-info "unexpected delete" {})))}]
+        (is (= #{} (<!! (gc/sweep! store #{} cutoff 1 opts))))
+        (<!! (k/assoc store :retained 1))
+        (<!! (k/assoc store :garbage 2))
+        (is (= #{:garbage} (<!! (gc/sweep! store #{:retained} cutoff 1 opts))))
+        (is (= 2 (<!! (k/get store :garbage))))
+        (is (= #{} (<!! (gc/sweep! store #{} (Date. 0) 1 opts))))
+        (<!! (k/assoc store :another 3))
+        (is (= #{:garbage :another}
+               (<!! (gc/sweep! store #{:retained} cutoff 1 opts))
+               (<!! (gc/sweep! store #{:retained} cutoff 1))))
+        (is (= #{:retained} (into #{} (map :key) (<!! (k/keys store))))))
+      (finally (delete-store root)))))
+
+(deftest sweep-report-keeps-the-observed-inventory-before-deletion
+  (let [root (str "target/konserve-gc-report/" (random-uuid))]
+    (try
+      (let [store (<!! (connect-fs-store root))
+            opts {:konserve.gc/report? true :konserve.gc/dry-run? true}
+            cutoff (future-date)]
+        (is (= {:konserve.gc/candidates #{} :konserve.gc/observed-keys #{}}
+               (<!! (gc/sweep! store #{} cutoff 1 opts))))
+        (<!! (k/assoc store :retained 1))
+        (<!! (k/assoc store :garbage 2))
+        (is (= {:konserve.gc/candidates #{} :konserve.gc/observed-keys #{:retained :garbage}}
+               (<!! (gc/sweep! store #{} (Date. 0) 1 opts))))
+        (let [report (<!! (gc/sweep! store #{:retained} cutoff 1 opts))]
+          (is (= {:konserve.gc/candidates #{:garbage}
+                  :konserve.gc/observed-keys #{:retained :garbage}} report))
+          (is (= 2 (<!! (k/get store :garbage))))
+          (is (= report (<!! (gc/sweep! store #{:retained} cutoff 1
+                                       {:konserve.gc/report? true}))))
+          (is (= #{:retained} (into #{} (map :key) (<!! (k/keys store)))))))
+      (finally (delete-store root)))))

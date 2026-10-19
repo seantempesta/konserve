@@ -1,0 +1,560 @@
+(ns konserve.indexeddb
+  (:require [clojure.core.async :refer [go take! put! close!] :include-macros true]
+            [superv.async :refer [go-try- <?-] :include-macros true]
+            [konserve.compressor]
+            [konserve.encryptor]
+            [konserve.impl.defaults :as defaults]
+            [konserve.impl.storage-layout :as storage-layout
+             :refer [PMultiWriteBackingStore PMultiReadBackingStore PReadMissSafe
+                     store-key-not-found-ex store-key-not-found?]]
+            [konserve.serializers]
+            [konserve.protocols :as protocols]
+            [konserve.store :as store]
+            [konserve.utils :refer-macros [with-promise]]))
+
+(defn connect-to-idb [db-name]
+  (let [req (js/window.indexedDB.open db-name 1)]
+    (with-promise out
+      (set! (.-onblocked req)
+            #(put! out (ex-info "connecting to indexed-db blocked"
+                                {:cause %
+                                 :caller 'konserve.indexeddb/connect-to-idb})))
+      (set! (.-onerror req)
+            #(put! out (ex-info "error connecting to indexed-db"
+                                {:cause %
+                                 :caller 'konserve.indexeddb/connect-to-idb})))
+      (set! (.-onsuccess req)
+            #(put! out (-> % .-target .-result)))
+      (set! (.-onupgradeneeded req)
+            (fn [ev]
+              (if (== 1 (.-oldVersion ev))
+                (throw (js/Error. "upgrade not supported at this time"))
+                (-> ev .-target .-result (.createObjectStore ""))))))))
+
+(defn delete-idb [db-name]
+  (let [req (js/window.indexedDB.deleteDatabase db-name)]
+    (with-promise out
+      (set! (.-onsuccess req) #(close! out))
+      (set! (.-onerror req)
+            #(put! out (ex-info (str "error deleting indexed-db with name '" db-name "'")
+                                {:cause %
+                                 :caller 'konserve.indexeddb/delete-idb}))))))
+
+(defn list-dbs []
+  (with-promise out
+    (let [p (js/window.indexedDB.databases)]
+      (.then p #(put! out %))
+      (.catch p #(put! out (ex-info "error listing databases"
+                                    {:cause %
+                                     :caller 'konserve.indexeddb/list-dbs}))))))
+
+(defn db-exists? [db-name]
+  (with-promise out
+    (take! (list-dbs)
+           (fn [res]
+             (if (instance? js/Error res)
+               (put! out false)
+               (put! out (reduce (fn [acc o]
+                                   (if (= db-name (goog.object.get o "name"))
+                                     (reduced true)
+                                     false))
+                                 false
+                                 res)))))))
+
+(defn read-blob [db key]
+  (let [req (.get (.objectStore (.transaction db #js[""]) "") key)]
+    (with-promise out
+      (set! (.-onsuccess req)
+            (fn [ev]
+              (if-some [v (-> ev .-target .-result)]
+                (put! out v)
+                ;; Absent key: signal not-found so io-operation's read-first path
+                ;; (PReadMissSafe) converts it to the caller's :not-found without a
+                ;; separate -blob-exists? probe. (`.get` returns undefined on a miss.)
+                (put! out (store-key-not-found-ex key)))))
+      (set! (.-onerror req)
+            #(put! out (ex-info (str "error reading blob at key '" key "'")
+                                {:cause %
+                                 :caller 'konserve.indexeddb/read-blob}))))))
+
+(defn write-blob [db key blob]
+  (let [req (.put (.objectStore (.transaction db #js[""] "readwrite") "") blob key)]
+    (with-promise out
+      (set! (.-onsuccess req) #(close! out))
+      (set! (.-onerror req)
+            #(put! out (ex-info (str "error writing blob at key '" key "'")
+                                {:cause %
+                                 :caller 'konserve.indexeddb/write-blob}))))))
+
+;;==============================================================================
+
+(defn flush-blob
+  [^BackingBlob {:keys [db key buf header metadata value]}]
+  (let [bin (if (some? buf)
+              #js[buf]
+              #js[header metadata value])
+        blob (js/Blob. bin #js{:type "application/octet-stream"})]
+    (with-promise out
+      (take! (write-blob db key blob)
+             (fn [err]
+               (if err
+                 (put! out (ex-info (str "error writing blob to objectStore at key '" key "'")
+                                    {:cause err
+                                     :caller 'konserve.indexeddb/flush-blob}))
+                 (close! out)))))))
+
+(defn- get-buf
+  "this ensures that blobs are cached on BackingBlobs as ArrayBuffers and read
+   from the db only once."
+  [^BackingBlob {:keys [db key buf] :as bb}]
+  (with-promise out
+    (if (some? buf)
+      (put! out buf)
+      (take! (read-blob db key)
+             (fn [res]
+               (if (instance? js/Error res)
+                 (put! out res)
+                 (let [p (.arrayBuffer res)]
+                   (.catch p #(put! out %))
+                   (.then p #(do
+                               (set! (.-buf ^BackingBlob bb) %)
+                               (put! out %))))))))))
+
+(defn- read-header
+  [^BackingBlob {:keys [_db _key _buf] :as this}]
+  (with-promise out
+    (take! (get-buf this)
+           (fn [res]
+             (cond
+               ;; propagate not-found un-wrapped so io-operation recognises it
+               (store-key-not-found? res) (put! out res)
+               (instance? js/Error res)
+               (put! out (ex-info "error reading blob from objectStore"
+                                  {:cause res
+                                   :caller 'konserve.indexeddb/read-header}))
+               :else
+               (let [view (js/Uint8Array. res)
+                     header (.slice view 0 storage-layout/header-size)]
+                 (put! out header)))))))
+
+(defn- read-binary
+  [^BackingBlob {:keys [db key _buf]} meta-size locked-cb]
+  (with-promise out
+    (take! (read-blob db key)
+           (fn [res]
+             (cond
+               (store-key-not-found? res) (put! out res)
+               (instance? js/Error res)
+               (put! out (ex-info "error reading blob from objectStore"
+                                  {:cause res
+                                   :caller 'konserve.indexeddb/read-binary}))
+               :else
+               (take!
+                (locked-cb {:input-stream (.stream res)
+                            :size (.-size res)
+                            :offset (+ meta-size storage-layout/header-size)})
+                #(put! out %)))))))
+
+(defn multi-write-blobs
+  "Execute multiple write operations in a single IndexedDB transaction.
+   All operations either succeed or all fail (atomic)."
+  [db store-key-values]
+  (with-promise out
+    (let [tx (.transaction db #js[""] "readwrite")
+          os (.objectStore tx "")
+          remaining-count (atom (count store-key-values))
+          errors (atom [])
+          results (atom {})]
+
+      ;; Set up transaction event handlers
+      (set! (.-oncomplete tx)
+            #(if (empty? @errors)
+               (put! out @results)
+               (put! out (ex-info "Error in multi-write transaction"
+                                  {:type :not-supported
+                                   :reason "One or more write operations failed"
+                                   :errors @errors}))))
+
+      (set! (.-onerror tx)
+            #(put! out (ex-info "Transaction failed"
+                                {:type :not-supported
+                                 :reason "IndexedDB transaction error"
+                                 :cause %})))
+
+      ;; Process each key-value pair in the transaction
+      (doseq [[store-key data] store-key-values]
+        (let [{:keys [header meta value]} data
+              bin #js[header meta value]
+              blob (js/Blob. bin #js{:type "application/octet-stream"})
+              req (.put os blob store-key)]
+
+          (set! (.-onsuccess req)
+                #(do (swap! results assoc store-key true)
+                     (swap! remaining-count dec)))
+
+          (set! (.-onerror req)
+                #(do (swap! errors conj {:key store-key :error %})
+                     (swap! remaining-count dec))))))))
+
+(defn multi-delete-blobs
+  "Execute multiple delete operations in a single IndexedDB transaction.
+   All operations either succeed or all fail (atomic).
+   Returns a map of store-keys to boolean indicating if the blob existed."
+  [db store-keys]
+  (with-promise out
+    (let [tx (.transaction db #js[""] "readwrite")
+          os (.objectStore tx "")
+          errors (atom [])
+          results (atom {})]
+
+      ;; Set up transaction event handlers
+      (set! (.-oncomplete tx)
+            #(if (empty? @errors)
+               (put! out @results)
+               (put! out (ex-info "Error in multi-delete transaction"
+                                  {:type :not-supported
+                                   :reason "One or more delete operations failed"
+                                   :errors @errors}))))
+
+      (set! (.-onerror tx)
+            #(put! out (ex-info "Transaction failed"
+                                {:type :not-supported
+                                 :reason "IndexedDB transaction error"
+                                 :cause %})))
+
+      ;; Process each key deletion in the transaction
+      (doseq [store-key store-keys]
+        ;; First check if key exists
+        (let [get-req (.get os store-key)]
+          (set! (.-onsuccess get-req)
+                (fn []
+                  (let [existed? (not (undefined? (.-result get-req)))
+                        del-req (.delete os store-key)]
+                    (set! (.-onsuccess del-req)
+                          (fn [] (swap! results assoc store-key existed?)))
+                    (set! (.-onerror del-req)
+                          (fn [err] (swap! errors conj {:key store-key :error err}))))))
+          (set! (.-onerror get-req)
+                (fn [err] (swap! errors conj {:key store-key :error err}))))))))
+
+(defrecord ^{:doc "buf is cached data that has been read from the db,
+                   & {header metadata value} are bin data to be written.
+                   If a write begins, buf is discarded."}
+ BackingBlob [db key buf header metadata value]
+  storage-layout/PBackingBlob
+  (-get-lock [_this _env]
+    (let [lock (reify
+                 storage-layout/PBackingLock
+                 (-release [_this _env] (go)))]
+      (go lock))) ;no-op but the alternative is to overwrite defaults/update-blob
+  (-sync [this _env] (.force this true))
+  (-close [this _env] (go (.close this)))
+  (-read-header [this _env] (read-header this)) ;=> ch<buf|err>
+  (-read-meta [_this meta-size _env]
+    (let [view (js/Uint8Array. buf)
+          bytes (.slice view
+                        storage-layout/header-size
+                        (+ storage-layout/header-size meta-size))]
+      (go bytes)))
+  (-read-value [_this meta-size _env]
+    (let [view (js/Uint8Array. buf)
+          bytes (.slice view (+ storage-layout/header-size meta-size))]
+      (go bytes)))
+  (-read-binary [this meta-size locked-cb _env]
+    (read-binary this meta-size locked-cb))
+  (-write-header [this header _env]
+    (go (set! (.-buf this) nil)
+        (set! (.-header this) header)))
+  (-write-meta [this meta-arr _env]
+    (go (set! (.-metadata this) meta-arr)))
+  (-write-value [this value-arr _meta-size _env]
+    (go (set! (.-value this) value-arr)))
+  (-write-binary [this _meta-size blob _env]
+    (go (set! (.-value this) blob)))
+  Object
+  (force [this _metadata?] (flush-blob this))
+  (close [this]
+    (do
+      (set! (.-db this) nil)
+      (set! (.-key this) nil)
+      (set! (.-buf this) nil)
+      (set! (.-header this) nil)
+      (set! (.-metadata this) nil)
+      (set! (.-value this) nil))))
+
+(defn open-backing-blob [db key] (BackingBlob. db key nil nil nil nil))
+
+(defn multi-read-blobs
+  "Execute multiple read operations in a single IndexedDB transaction.
+   Returns a sparse map of {store-key -> BackingBlob} for found keys only.
+   Missing keys are excluded from the result map."
+  [db store-keys]
+  (with-promise out
+    (let [tx (.transaction db #js[""] "readonly")
+          os (.objectStore tx "")
+          errors (atom [])
+          results (atom {})
+          remaining-count (atom (count store-keys))]
+
+      ;; Set up transaction event handlers
+      (set! (.-oncomplete tx)
+            #(if (empty? @errors)
+               (put! out @results)
+               (put! out (ex-info "Error in multi-read transaction"
+                                  {:type :not-supported
+                                   :reason "One or more read operations failed"
+                                   :errors @errors}))))
+
+      (set! (.-onerror tx)
+            #(put! out (ex-info "Transaction failed"
+                                {:type :not-supported
+                                 :reason "IndexedDB transaction error"
+                                 :cause %})))
+
+      ;; Process each key read in the transaction
+      (doseq [store-key store-keys]
+        (let [get-req (.get os store-key)]
+          (set! (.-onsuccess get-req)
+                (fn []
+                  (let [blob (.-result get-req)]
+                    ;; Only include found keys in result (sparse map)
+                    ;; BackingBlob will lazily load the buffer when needed
+                    (when (not (undefined? blob))
+                      (let [backing-blob (BackingBlob. db store-key nil nil nil nil)]
+                        (swap! results assoc store-key backing-blob)))
+                    (swap! remaining-count dec))))
+          (set! (.-onerror get-req)
+                (fn [err]
+                  (swap! errors conj {:key store-key :error err})
+                  (swap! remaining-count dec))))))))
+
+(defrecord IndexedDBackingStore [db-name db]
+  Object
+  ;; needed to unref conn before can cycle database construction
+  (close [_] (go (when (some? db) (.close db))))
+  storage-layout/PBackingStore
+  (-create-blob [_this store-key env]
+    (assert (not (:sync? env)) (str "-create-blob requires async, got env: " (pr-str env)))
+    (go (open-backing-blob db store-key)))
+  (-delete-blob [_this key env]
+    (assert (not (:sync? env)) (str "-delete-blob requires async, got env: " (pr-str env)))
+    (let [req (.delete (.objectStore (.transaction db #js[""] "readwrite") "") key)]
+      (with-promise out
+        (set! (.-onsuccess req) #(close! out))
+        (set! (.-onerror req)
+              #(put! out (ex-info (str "error deleting blob at key '" key "'")
+                                  {:cause %
+                                   :caller 'konserve.indexeddb/-delete-blob}))))))
+  (-migratable [_this _key _store-key _env] (go nil)) ;; no migration key (contract: key or nil)
+  (-blob-exists? [_this key env]
+    (assert (not (:sync? env)) (str "-blob-exists? requires async, got env: " (pr-str env)))
+    (let [req (.getKey (.objectStore (.transaction db #js[""]) "") key)]
+      (with-promise out
+        (set! (.-onsuccess req) #(put! out (-> % .-target .-result boolean)))
+        (set! (.-onerror req)
+              #(put! out (ex-info (str "error getting key in objectStore '" key "'")
+                                  {:cause %
+                                   :caller 'konserve.indexeddb/-blob-exists?}))))))
+  (-keys [_this env]
+    (assert (not (:sync? env)) (str "-keys requires async, got env: " (pr-str env)))
+    (let [req (.getAllKeys (.objectStore (.transaction db #js[""]) ""))]
+      (with-promise out
+        (set! (.-onsuccess req) #(put! out (-> % .-target .-result)))
+        (set! (.-onerror req)
+              #(put! out (ex-info "error listing keys in objectStore"
+                                  {:cause %
+                                   :caller 'konserve.indexeddb/-keys}))))))
+  (-copy [_this from to env]
+    (assert (not (:sync? env)))
+    (with-promise out
+      (take! (read-blob db from)
+             (fn [res]
+               (cond
+                 ;; Error reading source blob
+                 (instance? js/Error res)
+                 (put! out (ex-info "error reading blob from objectStore"
+                                    {:cause res
+                                     :caller 'konserve.indexeddb/-copy}))
+                 ;; Source blob doesn't exist (nil means key not found)
+                 ;; This is OK for backup copies of new keys - just succeed
+                 (nil? res)
+                 (close! out)
+                 ;; Source blob exists, copy it
+                 :else
+                 (take! (write-blob db to res)
+                        (fn [?err]
+                          (if ?err
+                            (put! out (ex-info "error writing blob to objectStore"
+                                               {:cause ?err
+                                                :caller 'konserve.indexeddb/-copy}))
+                            (close! out)))))))))
+  (-create-store [this env]
+    (assert (not (:sync? env)) (str "-create-store requires async, got env: " (pr-str env)))
+    (with-promise out
+      (take! (connect-to-idb db-name)
+             (fn [res]
+               (if (instance? js/Error res)
+                 (put! out (ex-info "error connecting to database"
+                                    {:cause res
+                                     :caller 'konserve.indexeddb/-create-store}))
+                 (do
+                   (set! (.-db this) res)
+                   (put! out this)))))))
+  (-delete-store [_this env]
+    (assert (not (:sync? env)))
+    (with-promise out
+      (.close db)
+      (take! (delete-idb db-name)
+             (fn [?err]
+               (if ?err
+                 (put! out (ex-info "error deleting store"
+                                    {:cause ?err
+                                     :caller 'konserve.indexeddb/-delete-store}))
+                 (close! out))))))
+  (-store-exists? [_this env]
+    (assert (not (:sync? env)))
+    (db-exists? db-name))
+  (-sync-store [_this env] (when-not (:sync? env) (go)))
+
+  ;; Implementation for atomic multi-key operations
+  PMultiWriteBackingStore
+  (-multi-write-blobs [_this store-key-values env]
+    (assert (not (:sync? env)))
+    (multi-write-blobs db store-key-values))
+  (-multi-delete-blobs [_this store-keys env]
+    (assert (not (:sync? env)))
+    (multi-delete-blobs db store-keys))
+
+  PMultiReadBackingStore
+  (-multi-read-blobs [_this store-keys env]
+    (assert (not (:sync? env)))
+    (multi-read-blobs db store-keys)))
+
+;; IndexedDB reads are read-miss-safe: -create-blob has no side effect (it only
+;; constructs a BackingBlob; unlike the filestore it never materialises the key),
+;; and read-blob signals store-key-not-found-ex on an absent key. So io-operation
+;; skips the -blob-exists? probe — a read is one `.get` transaction instead of
+;; `.getKey` (probe) + `.get`, and update-in/assoc-in/bassoc drop their probe too.
+(extend-type IndexedDBackingStore
+  PReadMissSafe)
+
+(defn read-web-stream
+  "Accepts the bget locked callback arg and returns a promise-chan containing
+   a concatenated byte array with the first offset bytes dropped
+   `(k/bget store :key read-web-stream)`"
+  [{:keys [input-stream offset]}]
+  (let [reader (.getReader input-stream)
+        chunks #js[]]
+    (with-promise out
+      (let [read-chunk (fn read-chunk []
+                         (.then (.read reader)
+                                (fn [result]
+                                  (if (.-done result)
+                                    (do
+                                      (some->> (.-value result) (.push chunks))
+                                      (if (== 1 (alength chunks))
+                                        (put! out (.slice (aget chunks 0) offset))
+                                        (let [total-length (reduce + (map count chunks))
+                                              final-array (js/Uint8Array. (inc total-length))
+                                              _i (atom 0)]
+                                          (doseq [chunk (array-seq chunks)]
+                                            (.set final-array chunk @_i)
+                                            (swap! _i + (alength chunk)))
+                                          (put! out (.slice final-array offset)))))
+                                    (do
+                                      (.push chunks (.-value result))
+                                      (read-chunk))))
+                                (fn [err] (put! out err))))]
+        (read-chunk)))))
+
+(defn connect-idb-store
+  "Connect to a IndexedDB backed KV store with the given db name.
+
+   This implementation stores all values as js/Blobs in an IndexedDB
+   object store instance. The object store itself is nameless, and there
+   is no use of versioning, indexing, or cursors.
+
+   This data is stored as if indexedDB was a filesystem. Since we do not have
+   file-descriptors to write with, strategy is to build a blob from components
+   (js/Blobs have a nice api explicitly for this) and flush the blob to
+   indexeddb storage on -sync-store calls (which doesnt concern consumers)
+
+   + all store ops are asynchronous only
+
+   + the database object must be 'unref'ed by calling db.close() before database
+   instances can be deleted. You can do this easily by calling store.close()
+   object method, which is unique to this impl. If you fail to maintain access to
+   db and core.async gets into a weird state due to an unhandled error, you
+   will be unable to delete the database until the vm is restarted
+
+   + As of November 2023 firefox does not support IDBFactory.databases() so
+   expect list-dbs, db-exists?, & PBackingStore/-store-exists? to all throw. You
+   must work around this by keeping track of each db name you intend to delete
+   https://developer.mozilla.org/en-US/docs/Web/API/IDBFactory/databases#browser_compatibility
+
+   + `konserve.core/bget` locked-cb arg is given a webstream that is *not* queued
+   to the value offset in the same way that the filestore implementations are.
+   See: https://developer.mozilla.org/en-US/docs/Web/API/Blob/stream
+     - consumers must discard the amount of bytes found in the :offset key of
+       the locked-cb arg map. These bytes are meta data for konserve and not
+       part of the value you are retrieving
+     - `konserve.indexeddb/read-web-stream` will accept the argument to the
+       locked-cb and return a promise-chan receiving err|bytes at the cost of
+       allocating a larger array for the chunks to be copied into"
+  [db-name & {:as params}]
+  (let [store-config (merge {:default-serializer :FressianSerializer
+                             :compressor         konserve.compressor/null-compressor
+                             :encryptor          konserve.encryptor/null-encryptor
+                             :read-handlers      (atom {})
+                             :write-handlers     (atom {})
+                             :config             {:sync-blob? true
+                                                  :in-place? true
+                                                  :no-backup? true  ;; IndexedDB is transactional, no backup needed
+                                                  :lock-blob? true}}
+                            (dissoc params :config))
+        backing            (IndexedDBackingStore. db-name nil)]
+    (defaults/connect-default-store backing store-config)))
+
+;; =============================================================================
+;; Multimethod Registration for konserve.store dispatch
+;; =============================================================================
+
+(defmethod store/-connect-store :indexeddb
+  [{:keys [name] :as config} opts]
+  (assert (false? (:sync? opts))
+          "IndexedDB store connections must be async (set :sync? to false)")
+  (go-try-
+   (let [exists (<?- (db-exists? name))]
+     (when-not exists
+       (throw (ex-info (str "IndexedDB store does not exist: " name)
+                       {:name name :config config})))
+     ;; Use connect-idb-store to get a proper DefaultStore, not raw IDBDatabase
+     ;; Pass config as keyword args using apply
+     (<?- (apply connect-idb-store name (apply concat (dissoc config :backend :name)))))))
+
+(defmethod store/-create-store :indexeddb
+  [{:keys [name] :as config} opts]
+  (assert (false? (:sync? opts))
+          "IndexedDB store creation must be async (set :sync? to false)")
+  (go-try-
+   (let [exists (<?- (db-exists? name))]
+     (when exists
+       (throw (ex-info (str "IndexedDB store already exists: " name)
+                       {:name name :config config})))
+     ;; Use connect-idb-store to get a proper DefaultStore, not raw IDBDatabase
+     ;; Pass config as keyword args using apply
+     (<?- (apply connect-idb-store name (apply concat (dissoc config :backend :name)))))))
+
+(defmethod store/-store-exists? :indexeddb
+  [{:keys [name]} opts]
+  (assert (false? (:sync? opts))
+          "IndexedDB store existence checks must be async (set :sync? to false)")
+  (db-exists? name))
+
+(defmethod store/-delete-store :indexeddb
+  [{:keys [name]} opts]
+  (delete-idb name))
+
+(defmethod store/-release-store :indexeddb
+  [_config _store opts]
+  (if (:sync? opts) nil (go-try- nil)))
