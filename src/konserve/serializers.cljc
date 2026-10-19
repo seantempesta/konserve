@@ -74,12 +74,22 @@
              (-name [_] "StringSerializer")
              (-namespace [_] "konserve.serializers")))
   PStoreSerializer
+  ;; DefaultStore hands a serializer an InputStream / OutputStream on the JVM
+  ;; (and on Jolt). The previous body bound *out* to the OutputStream, which
+  ;; throws ClassCastException (a ByteArrayOutputStream is not a Writer), and
+  ;; passed the InputStream to edn/read-string. EDN text is stored as UTF-8.
   (-deserialize [_ read-handlers s]
-    (read-string-safe @read-handlers s))
+    (read-string-safe @read-handlers
+                      #?(:cljs s
+                         :clj (if (string? s)
+                                s
+                                (String. ^bytes (.readAllBytes ^java.io.InputStream s) "UTF-8")))))
   (-serialize [_ #?(:clj output-stream :cljs _) _ val]
     #?(:cljs (pr-str val)
-       :clj (binding [clojure.core/*out* output-stream]
-              (pr val)))))
+       :clj (.write ^java.io.OutputStream output-stream
+                    ^bytes (.getBytes ^String (binding [*print-length* nil *print-level* nil]
+                                                (pr-str val))
+                                      "UTF-8")))))
 
 (defn string-serializer []
   (map->StringSerializer {}))
