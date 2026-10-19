@@ -1,0 +1,174 @@
+(ns konserve.jolt.lmdb
+  "A konserve store over LMDB for Jolt. Each konserve key is one LMDB entry:
+  key = the filestore's store-key (`<uuid>.ksv`), value = exactly the bytes a
+  `.ksv` file would hold (20-byte header, metadata, value). So a blob copied
+  out of LMDB into a directory is a valid konserve.filestore file and back.
+
+  The store runs in place (konserve's :in-place? true, :no-backup? true): one
+  write is one LMDB write transaction, durable at commit, so there is no
+  `.new` + rename. LMDB serializes writers itself (one writer per env across
+  processes), so blob locks are a no-op token. Reads are side-effect free and
+  report a miss from the read itself (PReadMissSafe), saving the existence
+  probe. Multi-key writes and deletes are one transaction."
+  (:require [konserve.impl.defaults :refer [connect-default-store]]
+            [konserve.impl.storage-layout :as sl
+             :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
+                     PMultiWriteBackingStore PMultiReadBackingStore header-size
+                     store-key-not-found-ex]]
+            [konserve.compressor :refer [null-compressor]]
+            [konserve.encryptor :refer [null-encryptor]]
+            [konserve.jolt.lmdb-ffi :as l]
+            [konserve.jolt.posix :as p]
+            [superv.async :refer [go-try- <?-]])
+  (:import [java.io ByteArrayInputStream]))
+
+(defmacro ^:private sync-or-go [env & body]
+  `(if (:sync? ~env) (do ~@body) (go-try- ~@body)))
+
+(def ^:private lock-token
+  (reify PBackingLock (-release [_ env] (sync-or-go env nil))))
+
+(defn- concat-bytes ^bytes [^bytes a ^bytes b ^bytes c]
+  (let [out (byte-array (+ (alength a) (alength b) (alength c)))]
+    (System/arraycopy a 0 out 0 (alength a))
+    (System/arraycopy b 0 out (alength a) (alength b))
+    (System/arraycopy c 0 out (+ (alength a) (alength b)) (alength c))
+    out))
+
+(defn- slice ^bytes [^bytes bs from n]
+  (let [out (byte-array n)] (System/arraycopy bs from out 0 n) out))
+
+(defn- input->bytes ^bytes [input]
+  (cond (bytes? input) input
+        (string? input) (.getBytes ^String input "UTF-8")
+        (instance? java.io.InputStream input) (.readAllBytes ^java.io.InputStream input)
+        :else (throw (ex-info "Unsupported binary input." {:type (type input)}))))
+
+(defprotocol ^:private IFlush (-flush [this]))
+
+;; A blob is the entry's bytes as read when it was opened (nil when absent),
+;; plus the parts written since. -sync / -close puts the new bytes once.
+(deftype LmdbBlob [db store-key existing
+                   ^:unsynchronized-mutable header
+                   ^:unsynchronized-mutable meta
+                   ^:unsynchronized-mutable value
+                   ^:unsynchronized-mutable dirty?]
+  PBackingBlob
+  (-sync [this env] (sync-or-go env (-flush this)))
+  (-close [this env] (sync-or-go env (-flush this) nil))
+  (-get-lock [_ env] (sync-or-go env lock-token))
+  (-read-header [_ env]
+    (sync-or-go env
+                (when (nil? existing) (throw (store-key-not-found-ex store-key)))
+                (slice existing 0 (min header-size (alength ^bytes existing)))))
+  (-read-meta [_ meta-size env]
+    (sync-or-go env (slice existing (:header-size env) meta-size)))
+  (-read-value [_ meta-size env]
+    (sync-or-go env
+                (let [start (+ (:header-size env) meta-size)]
+                  (slice existing start (- (alength ^bytes existing) start)))))
+  (-read-binary [_ meta-size locked-cb env]
+    (let [start (+ (:header-size env) meta-size)
+          arg {:input-stream (ByteArrayInputStream. (slice existing start (- (alength ^bytes existing) start)))
+               :size (alength ^bytes existing)}]
+      (if (:sync? env) (locked-cb arg) (go-try- (<?- (locked-cb arg))))))
+  (-write-header [_ h env] (sync-or-go env (set! header h) (set! dirty? true)))
+  (-write-meta [_ m env] (sync-or-go env (set! meta m) (set! dirty? true)))
+  (-write-value [_ v _meta-size env] (sync-or-go env (set! value v) (set! dirty? true)))
+  (-write-binary [_ _meta-size blob env]
+    (sync-or-go env (set! value (input->bytes blob)) (set! dirty? true)))
+
+  IFlush
+  (-flush [_]
+    (when dirty?
+      (set! dirty? false)
+      (let [bs (concat-bytes header meta value)]
+        (l/write-txn db (fn [txn] (l/put-bytes! db txn store-key bs)))))
+    nil))
+
+(defn- blob [db store-key existing]
+  (->LmdbBlob db store-key existing nil nil nil false))
+
+(defonce ^:private envs (atom {}))
+
+(defn open-env!
+  "The process's one env handle for directory path (LMDB forbids opening one
+  env twice in a process)."
+  [path opts]
+  (or (get @envs path)
+      (locking envs
+        (or (get @envs path)
+            (do (p/mkdirs! path)
+                (let [db (l/open-env path opts)]
+                  (swap! envs assoc path db)
+                  db))))))
+
+(defn close-env! [path]
+  (when-let [db (get @envs path)]
+    (swap! envs dissoc path)
+    (l/close-env db)))
+
+(defrecord BackingLmdb [db]
+  PBackingStore
+  (-create-blob [_ store-key env]
+    (sync-or-go env (blob db store-key (l/read-txn db #(l/get-bytes db % store-key)))))
+  (-delete-blob [_ store-key env]
+    (sync-or-go env (l/write-txn db #(l/del! db % store-key))))
+  (-blob-exists? [_ store-key env]
+    (sync-or-go env (l/read-txn db #(l/exists-in? db % store-key))))
+  (-migratable [_ _ _ env] (sync-or-go env false))
+  (-migrate [_ _ _ _ _ _ env] (sync-or-go env false))
+  (-handle-foreign-key [_ _ _ _ _ env] (sync-or-go env []))
+  (-keys [_ env] (sync-or-go env (l/read-txn db #(l/all-keys db %))))
+  (-copy [_ from to env]
+    (sync-or-go env (l/write-txn db #(l/put-bytes! db % to (l/get-bytes db % from)))))
+  (-atomic-move [_ from to env]
+    (sync-or-go env (l/write-txn db (fn [txn]
+                                      (l/put-bytes! db txn to (l/get-bytes db txn from))
+                                      (l/del! db txn from)))))
+  (-create-store [_ env] (sync-or-go env true))
+  (-delete-store [_ env]
+    (sync-or-go env (l/write-txn db (fn [txn] (doseq [k (l/all-keys db txn)] (l/del! db txn k))))))
+  (-store-exists? [_ env] (sync-or-go env true))
+  ;; commits are already durable (no MDB_NOSYNC); env_sync covers a NOSYNC env.
+  (-sync-store [_ env] (sync-or-go env (l/sync! db) nil))
+
+  PReadMissSafe
+
+  PMultiWriteBackingStore
+  (-multi-write-blobs [_ store-key-values env]
+    (sync-or-go env
+                (l/write-txn db (fn [txn]
+                                  (into {} (for [[sk {:keys [header meta value]}] store-key-values]
+                                             (do (l/put-bytes! db txn sk (concat-bytes header meta value))
+                                                 [sk true])))))))
+  (-multi-delete-blobs [_ store-keys env]
+    (sync-or-go env
+                (l/write-txn db (fn [txn] (into {} (for [sk store-keys] [sk (l/del! db txn sk)]))))))
+
+  PMultiReadBackingStore
+  (-multi-read-blobs [_ store-keys env]
+    (sync-or-go env
+                (l/read-txn db (fn [txn]
+                                 (into {} (for [sk store-keys
+                                                :let [bs (l/get-bytes db txn sk)]
+                                                :when bs]
+                                            [sk (blob db sk bs)])))))))
+
+(defn connect-lmdb-store
+  "A konserve store in LMDB env directory `path`. Options as
+  konserve.filestore/connect-fs-store plus :lmdb {:map-size :max-readers :flags}."
+  [path & {:keys [config lmdb] :as params}]
+  (let [db (open-env! path lmdb)
+        store-config (merge {:default-serializer :StringSerializer
+                             :compressor null-compressor
+                             :encryptor null-encryptor
+                             :read-handlers (atom {})
+                             :write-handlers (atom {})
+                             :buffer-size (* 1024 1024)
+                             :opts {:sync? false}
+                             :config (merge {:sync-blob? false :in-place? true :no-backup? true
+                                             :lock-blob? true}
+                                            config)}
+                            (dissoc params :config :lmdb))]
+    (connect-default-store (->BackingLmdb db) store-config)))

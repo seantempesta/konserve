@@ -1,0 +1,170 @@
+(ns konserve.jolt.lmdb-ffi
+  "Minimal LMDB binding over jolt.ffi: one env, the unnamed database, write
+  transactions run start-to-commit inside one call, read transactions MDB_NOTLS
+  so any thread (go blocks, fibers) can run them. Values are copied out of the
+  map before the read transaction ends."
+  (:require [jolt.ffi :as ffi]))
+
+(def lib-path
+  (or (System/getenv "JOLT_LMDB_LIB")
+      (str (System/getProperty "user.home") "/src/seon-jolt/vendor-c/lmdb/libraries/liblmdb/liblmdb.dylib")))
+
+(ffi/load-library lib-path)
+
+(def MDB_NOSUBDIR 0x4000)
+(def MDB_NOSYNC 0x10000)
+(def MDB_RDONLY 0x20000)
+(def MDB_NOMETASYNC 0x40000)
+(def MDB_WRITEMAP 0x80000)
+(def MDB_NOTLS 0x200000)
+(def MDB_NORDAHEAD 0x800000)
+(def MDB_CREATE 0x40000)
+(def MDB_NEXT 8)
+(def MDB_NOTFOUND -30798)
+
+(ffi/defcfn mdb-env-create "mdb_env_create" [:pointer] :int)
+(ffi/defcfn mdb-env-set-mapsize "mdb_env_set_mapsize" [:pointer :size_t] :int)
+(ffi/defcfn mdb-env-set-maxreaders "mdb_env_set_maxreaders" [:pointer :uint] :int)
+(ffi/defcfn mdb-env-open "mdb_env_open" [:pointer :string :uint :int] :int)
+(ffi/defcfn mdb-env-close "mdb_env_close" [:pointer] :void)
+(ffi/defcfn mdb-env-sync "mdb_env_sync" [:pointer :int] :int {:blocking true})
+(ffi/defcfn mdb-txn-begin "mdb_txn_begin" [:pointer :pointer :uint :pointer] :int {:blocking true})
+(ffi/defcfn mdb-txn-commit "mdb_txn_commit" [:pointer] :int {:blocking true})
+(ffi/defcfn mdb-txn-abort "mdb_txn_abort" [:pointer] :void)
+(ffi/defcfn mdb-dbi-open "mdb_dbi_open" [:pointer :string :uint :pointer] :int)
+(ffi/defcfn mdb-get "mdb_get" [:pointer :uint :pointer :pointer] :int)
+(ffi/defcfn mdb-put "mdb_put" [:pointer :uint :pointer :pointer :uint] :int)
+(ffi/defcfn mdb-del "mdb_del" [:pointer :uint :pointer :pointer] :int)
+(ffi/defcfn mdb-cursor-open "mdb_cursor_open" [:pointer :uint :pointer] :int)
+(ffi/defcfn mdb-cursor-get "mdb_cursor_get" [:pointer :pointer :pointer :int] :int)
+(ffi/defcfn mdb-cursor-close "mdb_cursor_close" [:pointer] :void)
+(ffi/defcfn mdb-strerror "mdb_strerror" [:int] :string)
+(ffi/defcfn mdb-reader-check "mdb_reader_check" [:pointer :pointer] :int)
+
+(defn- check [op rc]
+  (when-not (zero? rc)
+    (throw (ex-info (str "lmdb " op ": " (mdb-strerror rc)) {:op op :rc rc :type :lmdb-error})))
+  rc)
+
+(defn open-env
+  "Open (creating) the env directory `path`. Answers {:env ptr :dbi n :path}."
+  [path {:keys [map-size max-readers flags] :or {map-size (* 1024 1024 1024) max-readers 126 flags 0}}]
+  (let [pp (ffi/alloc :pointer)]
+    (try
+      (check "env_create" (mdb-env-create pp))
+      (let [env (ffi/read pp :pointer)]
+        (check "env_set_mapsize" (mdb-env-set-mapsize env map-size))
+        (check "env_set_maxreaders" (mdb-env-set-maxreaders env max-readers))
+        (check "env_open" (mdb-env-open env path (bit-or MDB_NOTLS flags) 0664))
+        (check "txn_begin" (mdb-txn-begin env ffi/null 0 pp))
+        (let [txn (ffi/read pp :pointer)
+              dp (ffi/alloc :uint32)]
+          (try
+            (check "dbi_open" (mdb-dbi-open txn nil 0 dp))
+            (let [dbi (ffi/read dp :uint32)]
+              (check "txn_commit" (mdb-txn-commit txn))
+              {:env env :dbi dbi :path path})
+            (finally (ffi/free dp)))))
+      (finally (ffi/free pp)))))
+
+(defn close-env [{:keys [env]}] (mdb-env-close env))
+
+(defn- begin [env flags]
+  (let [pp (ffi/alloc :pointer)]
+    (try (check "txn_begin" (mdb-txn-begin env ffi/null flags pp))
+         (ffi/read pp :pointer)
+         (finally (ffi/free pp)))))
+
+;; MDB_val {size_t mv_size; void *mv_data}
+(defn- set-val! [v size data] (ffi/write v :size_t size 0) (ffi/write v :pointer data 8))
+(defn- val-size [v] (ffi/read v :size_t 0))
+(defn- val-data [v] (ffi/read v :pointer 8))
+
+(defn- with-key [^String k f]
+  (let [kb (.getBytes k "UTF-8")
+        n (alength kb)
+        buf (ffi/alloc (+ 32 n))
+        kv buf
+        dv (+ buf 16)
+        kdata (+ buf 32)]
+    (try
+      (ffi/write-array kdata kb)
+      (set-val! kv n kdata)
+      (f kv dv)
+      (finally (ffi/free buf)))))
+
+(defn read-txn
+  "Run (f txn) in a read-only transaction."
+  [{:keys [env]} f]
+  (let [txn (begin env MDB_RDONLY)]
+    (try (f txn) (finally (mdb-txn-abort txn)))))
+
+(defn write-txn
+  "Run (f txn) in a write transaction and commit it; abort on exception."
+  [{:keys [env]} f]
+  (let [txn (begin env 0)]
+    (try
+      (let [r (f txn)]
+        (check "txn_commit" (mdb-txn-commit txn))
+        r)
+      (catch Throwable e
+        (mdb-txn-abort txn)
+        (throw e)))))
+
+(defn get-bytes
+  "Value bytes for key k in txn, or nil."
+  [{:keys [dbi]} txn k]
+  (with-key k
+    (fn [kv dv]
+      (let [rc (mdb-get txn dbi kv dv)]
+        (cond
+          (= rc MDB_NOTFOUND) nil
+          :else (do (check "get" rc)
+                    (let [n (val-size dv)]
+                      (if (zero? n) (byte-array 0) (ffi/read-array (val-data dv) n)))))))))
+
+(defn exists-in? [{:keys [dbi]} txn k]
+  (with-key k (fn [kv dv] (let [rc (mdb-get txn dbi kv dv)]
+                            (if (= rc MDB_NOTFOUND) false (do (check "get" rc) true))))))
+
+(defn put-bytes! [{:keys [dbi]} txn k ^bytes v]
+  (with-key k
+    (fn [kv dv]
+      (let [n (alength v)
+            vb (ffi/alloc (max 1 n))]
+        (try
+          (ffi/write-array vb v)
+          (set-val! dv n vb)
+          (check "put" (mdb-put txn dbi kv dv 0))
+          (finally (ffi/free vb)))))))
+
+(defn del! [{:keys [dbi]} txn k]
+  (with-key k (fn [kv _] (let [rc (mdb-del txn dbi kv ffi/null)]
+                           (if (= rc MDB_NOTFOUND) false (do (check "del" rc) true))))))
+
+(defn all-keys
+  "Every key in the database, as strings."
+  [{:keys [dbi]} txn]
+  (let [buf (ffi/alloc 48)
+        cp buf kv (+ buf 16) dv (+ buf 32)]
+    (try
+      (check "cursor_open" (mdb-cursor-open txn dbi cp))
+      (let [cur (ffi/read cp :pointer)]
+        (try
+          (loop [acc (transient [])]
+            (let [rc (mdb-cursor-get cur kv dv MDB_NEXT)]
+              (if (= rc MDB_NOTFOUND)
+                (persistent! acc)
+                (do (check "cursor_get" rc)
+                    (recur (conj! acc (String. ^bytes (ffi/read-array (val-data kv) (val-size kv)) "UTF-8")))))))
+          (finally (mdb-cursor-close cur))))
+      (finally (ffi/free buf)))))
+
+(defn sync! [{:keys [env]}] (check "env_sync" (mdb-env-sync env 1)))
+
+(defn reader-check
+  "Clear stale reader slots of dead processes; answers the count cleared."
+  [{:keys [env]}]
+  (let [p (ffi/alloc :int32)]
+    (try (check "reader_check" (mdb-reader-check env p)) (ffi/read p :int32)
+         (finally (ffi/free p)))))
