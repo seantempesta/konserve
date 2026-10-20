@@ -101,10 +101,16 @@
   (let [txn (begin env MDB_RDONLY)]
     (try (f txn) (finally (mdb-txn-abort txn)))))
 
+;; L1 measurement probe (not for merge): write transactions begun, and the time spent
+;; waiting in mdb_txn_begin (LMDB's write lock), in ns; waits over 50 us counted.
+(def write-txn-probe (atom {:txns 0 :wait-ns 0 :waits 0}))
 (defn write-txn
   "Run (f txn) in a write transaction and commit it; abort on exception."
   [{:keys [env]} f]
-  (let [txn (begin env 0)]
+  (let [t0 (System/nanoTime)
+        txn (begin env 0)
+        w (- (System/nanoTime) t0)
+        _ (swap! write-txn-probe (fn [m] (-> m (update :txns inc) (update :wait-ns + w) (cond-> (> w 50000) (update :waits inc)))))]
     (try
       (let [r (f txn)]
         (check "txn_commit" (mdb-txn-commit txn))
