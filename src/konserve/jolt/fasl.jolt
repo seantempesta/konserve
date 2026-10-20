@@ -1,0 +1,29 @@
+(ns konserve.jolt.fasl
+  "jfasl: Jolt values <-> bytes through Chez fasl with interned objects as externals
+  (src/konserve/jolt/jfasl.ss; from lane X1, seon-jolt x1/src/x1/codec.clj at d07a2a8). encode answers a byte-array sharing the fasl bytevector."
+  (:require [jolt.scheme :as s] [clojure.java.io :as io]))
+
+(defmacro ^:private scheme-source [] (slurp (or (io/resource "konserve/jolt/jfasl.ss") "src/konserve/jolt/jfasl.ss")))
+;; the Scheme text is read at compile time, so a built binary carries it
+(defonce ^:private loaded (s/eval-string (str "(begin " (scheme-source) ")")))
+
+(def ^:private enc (s/proc "x1-encode"))
+(def ^:private dec (s/proc "x1-decode"))
+(def ^:private bv->ba (s/proc "x1-bv->ba"))
+(def ^:private ba->bv (s/proc "x1-ba->bv"))
+(def ^:private reg! (s/proc "x1-register-handler!"))
+
+(defn encode-bv "v as a fasl bytevector (a host value)." [v] (enc v))
+(defn decode-bv "The value in a fasl bytevector." [bv] (dec bv))
+(defn encode "v as a byte-array." ^bytes [v] (bv->ba (enc v)))
+(defn decode "The value in a byte-array from encode." [^bytes b] (dec (ba->bv b)))
+(defn bv-length [bv] (s/call "bytevector-length" bv))
+(def ^:private tag-of (s/eval-string "(lambda (x) (jrdesc-tag (jrec-desc x)))"))
+(defn type-tag "The runtime's type tag of a deftype/defrecord instance." [x] (tag-of x))
+(def ^:private jrec?* (s/eval-string "(lambda (x) (jrec? x))"))
+(defn jrec? "Is x a deftype/defrecord instance?" [x] (jrec?* x))
+
+(defn register-handler!
+  "Instances of the deftype/defrecord with this type tag (type-tag) travel as (dump x), plain data
+  (no keywords), and come back as (restore data)."
+  [tag dump restore] (reg! tag dump restore))
