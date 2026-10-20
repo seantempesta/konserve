@@ -9,6 +9,9 @@
 (defn sweep!
   "Deletes keys outside the whitelist that precede the retention instant.
 
+  With `:konserve.gc/sync-io? true`, the key listing and the deletions use the store's
+  synchronous operations (still returning a channel).
+
   With `:konserve.gc/dry-run? true`, returns the selected logical keys without
   deleting them or invoking deletion callbacks. Selection and batching are identical.
 
@@ -29,7 +32,12 @@
    (sweep! store whitelist ts batch-size {}))
   ([store whitelist ts batch-size opts]
    (go-try-
-    (let [metadata (<?- (k/keys store))
+    (let [sync-io? (:konserve.gc/sync-io? opts)
+          ;; :konserve.gc/sync-io? true lists and deletes through the store's synchronous
+          ;; operations, which a sweep run by one blocking owner (a writer-side maintenance
+          ;; proc) wants: the async path costs a channel hand-off per key read on hosts
+          ;; where that is not cheap (Jolt: 990 ms against 75 ms for 6,200 keys on LMDB).
+          metadata (if sync-io? (k/keys store {:sync? true}) (<?- (k/keys store)))
           observed (when (:konserve.gc/report? opts)
                      (into #{} (map :key) metadata))
           to-delete (->> metadata
@@ -51,8 +59,10 @@
              (if (utils/multi-key-capable? store)
              ;; Use multi-dissoc for batch deletion if supported
              (let [keys-to-delete (mapv :key batch)]
-               (<?- (k/multi-dissoc store keys-to-delete
-                                    (assoc opts :sync? false)))
+               (if sync-io?
+                 (k/multi-dissoc store keys-to-delete (assoc opts :sync? true))
+                 (<?- (k/multi-dissoc store keys-to-delete
+                                      (assoc opts :sync? false))))
                (into deleted-files keys-to-delete))
              ;; Fallback to single operations for stores without multi-key support.
              ;; GC does not use dissoc's existed? return, so :ignore-existence? lets
