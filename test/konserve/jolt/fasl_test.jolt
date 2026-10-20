@@ -1,0 +1,69 @@
+(ns konserve.jolt.fasl-test
+  "jfasl round trips (Jolt only): every encodable kind comes back equal, with its metadata, and
+  the bytes name values by meaning (a keyword or a record type is written once per message)."
+  (:require [clojure.test :refer [deftest is testing]] [konserve.jolt.fasl :as c]))
+
+(defrecord P [a b])
+(deftype T [x y z])
+
+(defn- rt [v] (c/decode (c/encode v)))
+
+(def ^:private values
+  [nil true false 0 1 -1 127 128 -129 9007199254740993 Long/MAX_VALUE Long/MIN_VALUE
+   (* Long/MAX_VALUE 4) (- (* Long/MAX_VALUE 4)) 12345678901234567890123N
+   1.5 -0.0 ##Inf 1e300 (float 1.25) 22/7 -1/3 1.5M 123.456M
+   \a (char 233) (char 20013) "" "abc" (str "h" (char 233) "llo " (char 20013) (String. (Character/toChars 128512)))
+   :a :ns/a :a/b.c 'sym 'ns/sym
+   [] [1 [2 [3]]] (vec (range 2000)) {} {:a 1 :b {:c [1 2]}} (into {} (map (fn [i] [i (str i)]) (range 50)))
+   (zipmap (map #(keyword (str "k" %)) (range 30)) (range 30)) #{} #{1 2 3} (set (range 100)) #{:a "b" [1]}
+   '() '(1 2 3) (list :a (list :b)) (first {:a 1})
+   #uuid "6ba7b810-9dad-11d1-80b4-00c04fd430c8" #inst "2026-10-20T12:34:56.789Z" (tagged-literal 'foo [1 2])
+   (->P 1 [2]) (assoc (->P 1 2) :extra 3)
+   {:nested [{:id #uuid "00000000-0000-4000-8000-000000000001" :at #inst "2020-01-01" :tags #{:x :y} :vals '(1.5 2N 3/4)}]}])
+
+(deftest round-trip
+  (doseq [v values]
+    (let [w (rt v)]
+      (is (= v w))
+      (is (= (type v) (type w)))
+      (is (= (hash v) (hash w))))))
+
+(deftest array-maps-keep-their-order
+  (let [m (array-map :z 1 :a 2 :m 3)]
+    (is (= (seq m) (seq (rt m))))))
+
+(deftest metadata-travels
+  (doseq [v [(with-meta [1 2] {:m 1}) (with-meta {:a 1} {:m 2}) (with-meta #{1} {:m 3})
+             (with-meta '(1) {:m 4}) (with-meta 'sym {:line 3})]]
+    (is (= (meta v) (meta (rt v))))))
+
+(deftest seqs-come-back-lists
+  (doseq [v [(map inc (range 10)) (seq [1 2 3]) (range 5) (seq {:a 1 :b 2})]]
+    (is (= v (rt v)))
+    (is (list? (rt v)))))
+
+(deftest deftypes-travel-by-field
+  (let [t (rt (->T 1 "two" :three))]
+    (is (instance? T t))
+    (is (= [1 "two" :three] [(.-x t) (.-y t) (.-z t)]))))
+
+(deftest bytes-travel
+  (is (= [1 2 3 -1] (vec (rt (byte-array [1 2 3 -1]))))))
+
+(deftest names-are-written-once
+  (testing "200 occurrences of one keyword cost one name and a byte each after it"
+    (is (< (count (c/encode (vec (repeat 200 :seon.eval/shown)))) 450))))
+
+(deftest a-type-without-an-encoding-is-refused
+  (is (thrown? Exception (c/encode (atom 1)))))
+
+(deftest other-bytes-are-refused
+  (is (thrown? Exception (c/decode (byte-array [0 0 0 0 99 104 101 122])))))
+
+(deftype H [a b])
+(c/register-handler! (c/type-tag (->H 0 0)) (fn [h] [(.-a h) (.-b h)]) (fn [[a b]] (->H a b)))
+
+(deftest handlers-dump-and-restore
+  (let [[x y] (rt [(->H 1 :k) (->H 2 :k)])]
+    (is (instance? H y))
+    (is (= [1 :k 2 :k] [(.-a x) (.-b x) (.-a y) (.-b y)]))))
