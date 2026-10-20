@@ -40,6 +40,8 @@
 (ffi/defcfn mdb-cursor-close "mdb_cursor_close" [:pointer] :void)
 (ffi/defcfn mdb-strerror "mdb_strerror" [:int] :string)
 (ffi/defcfn mdb-reader-check "mdb_reader_check" [:pointer :pointer] :int)
+(ffi/defcfn mdb-env-copy2 "mdb_env_copy2" [:pointer :pointer :uint] :int {:blocking true})
+(def MDB_CP_COMPACT 1)
 
 (defn- check [op rc]
   (when-not (zero? rc)
@@ -167,4 +169,14 @@
   [{:keys [env]}]
   (let [p (ffi/alloc :int32)]
     (try (check "reader_check" (mdb-reader-check env p)) (ffi/read p :int32)
+         (finally (ffi/free p)))))
+
+(defn compact-copy!
+  "Write a compacted copy of the env to directory dst (which must exist and hold no
+  data.mdb): mdb_env_copy2 with MDB_CP_COMPACT, which writes only the pages in use, in
+  order, so freed pages (a sweep's deletions) leave the file. The copy reads one
+  snapshot: commits made while it runs are not in it. nil."
+  [{:keys [env]} ^String dst]
+  (let [p (ffi/string->ptr dst)]
+    (try (check "env_copy2" (mdb-env-copy2 env p MDB_CP_COMPACT))
          (finally (ffi/free p)))))
