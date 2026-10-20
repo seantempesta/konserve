@@ -99,9 +99,26 @@
                             :cljs (type v)) k]) m)
        (into {})))
 
+;; Jolt: Chez fasl (lane X1's jfasl). Resolved at first use, once, so konserve's
+;; load does not pay for loading the codec's Scheme source.
+#?(:jolt (def ^:private fasl-ser (delay (requiring-resolve 'konserve.jolt.fasl-store/serialize))))
+#?(:jolt (def ^:private fasl-deser (delay (requiring-resolve 'konserve.jolt.fasl-store/deserialize))))
+
+#?(:jolt
+   (defrecord FaslSerializer []
+     PStoreSerializer
+     (-deserialize [_ read-handlers bytes]
+       (let [^bytes arr (if (bytes? bytes) bytes (.readAllBytes ^java.io.InputStream bytes))]
+         (@fasl-deser @read-handlers arr)))
+     (-serialize [_ output-stream _ val]
+       (.write ^java.io.OutputStream output-stream ^bytes (@fasl-ser val)))))
+
+#?(:jolt (defn fasl-serializer [] (map->FaslSerializer {})))
+
 (def byte->serializer
   {0 (string-serializer)
    1 (fressian-serializer)
+   #?@(:jolt [4 (fasl-serializer)])
    #?@(:jolt [] :clj [2 (cbor-serializer)])})
 
 (def serializer-class->byte

@@ -1,0 +1,38 @@
+(ns konserve.jolt.fasl-store
+  "konserve values <-> jfasl bytes for Datahike's store. Index nodes and index roots,
+  whose live form holds per-store objects (Settings, the storage, the comparator), are
+  written as the tagged literals their EDN print form already uses (pss/leaf, pss/branch,
+  pss/set) and come back through the store's own EDN read handlers, so a node read from
+  fasl is built by the same function as one read from EDN. Everything else is plain fasl."
+  (:require [konserve.jolt.fasl :as c]))
+
+(def ^:private leaf-tag "org.replikativ.persistent-sorted-set.Leaf")
+(def ^:private branch-tag "org.replikativ.persistent-sorted-set.Branch")
+(def ^:private set-tag "org.replikativ.persistent-sorted-set.PersistentSortedSet")
+
+(defn- tag "Type tag of a deftype instance, else nil." [v] (when (c/jrec? v) (c/type-tag v)))
+
+(defn freeze
+  "v with index nodes and roots (at the top, or as map values, nested) as tagged literals."
+  [v]
+  (let [t (tag v)]
+    (cond
+      (= t leaf-tag) (tagged-literal 'pss/leaf (.keys v))
+      (= t branch-tag) (tagged-literal 'pss/branch {:level (.level v) :keys (.keys v) :addresses (.addresses v)
+                                                    :subtree-count (.-_subtreeCount v)})
+      (= t set-tag) (do (when-not (.-_address v) (throw (ex-info "unflushed index cannot be serialized" {})))
+                        (tagged-literal 'pss/set {:address (.-_address v) :count (.-_count v) :meta (meta v)}))
+      (map? v) (reduce-kv (fn [m k x] (let [y (freeze x)] (if (identical? x y) m (assoc m k y)))) v v)
+      :else v)))
+
+(defn thaw
+  "The inverse of freeze: each tagged literal through its read handler (the store's
+  read-handlers map, symbol -> fn)."
+  [handlers v]
+  (cond
+    (tagged-literal? v) ((or (get handlers (:tag v)) (throw (ex-info "no read handler" {:tag (:tag v)}))) (:form v))
+    (map? v) (reduce-kv (fn [m k x] (let [y (thaw handlers x)] (if (identical? x y) m (assoc m k y)))) v v)
+    :else v))
+
+(defn serialize "v as jfasl bytes (byte-array)." ^bytes [v] (c/encode (freeze v)))
+(defn deserialize "The value of jfasl bytes, its nodes built by handlers." [handlers ^bytes b] (thaw handlers (c/decode b)))
