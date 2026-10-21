@@ -13,7 +13,7 @@
   (:require [konserve.impl.defaults :refer [connect-default-store]]
             [konserve.impl.storage-layout :as sl
              :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
-                     PMultiWriteBackingStore PMultiReadBackingStore header-size
+                     PMultiWriteBackingStore PMultiReadBackingStore PTransactBackingStore header-size
                      store-key-not-found-ex]]
             [konserve.compressor :refer [null-compressor]]
             [konserve.encryptor :refer [null-encryptor]]
@@ -134,6 +134,10 @@
   (-sync-store [_ env] (sync-or-go env (l/sync! db) nil))
 
   PReadMissSafe
+
+  ;; a read-modify-write of several keys (konserve.core/append) as one write transaction
+  PTransactBackingStore
+  (-transact [_ f] (l/transact db f))
 
   PMultiWriteBackingStore
   (-multi-write-blobs [_ store-key-values env]

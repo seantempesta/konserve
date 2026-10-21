@@ -228,6 +228,16 @@
      Returns a map of store-keys to boolean indicating if the blob existed before deletion.
      Backends must implement this to support multi-key operations."))
 
+(defprotocol PTransactBackingStore
+  "Protocol for backing stores that can run several reads and writes as one
+  transaction, atomic across every process using the store (e.g. one LMDB write
+  transaction): a read-modify-write of several keys, such as an append to a log,
+  that no other writer can interleave with and that no crash can leave half done."
+  (-transact [this f]
+    "Run (f) synchronously with every read and write this backing store makes on the
+     calling thread inside one transaction: committed when f returns, abandoned when it
+     throws. Answers f's value. f must make only synchronous ({:sync? true}) calls."))
+
 (defprotocol PMultiReadBackingStore
   "Protocol for backing stores that support atomic multi-key reads."
   (-multi-read-blobs [this store-keys env]

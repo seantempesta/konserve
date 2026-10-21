@@ -95,23 +95,44 @@
       (f kv dv)
       (finally (ffi/free buf)))))
 
+(def ^:dynamic *txn*
+  "The write transaction `transact` holds on this thread, or nil: inside it every read-txn
+  and write-txn of this thread runs in it, so they commit or abort together."
+  nil)
+
 (defn read-txn
-  "Run (f txn) in a read-only transaction."
+  "Run (f txn) in a read-only transaction (in `transact`'s, when one is open)."
   [{:keys [env]} f]
-  (let [txn (begin env MDB_RDONLY)]
-    (try (f txn) (finally (mdb-txn-abort txn)))))
+  (if-some [t *txn*]
+    (f t)
+    (let [txn (begin env MDB_RDONLY)]
+      (try (f txn) (finally (mdb-txn-abort txn))))))
+
+(defn- commit-or-abort [txn f]
+  (try
+    (let [r (f txn)]
+      (check "txn_commit" (mdb-txn-commit txn))
+      r)
+    (catch Throwable e
+      (mdb-txn-abort txn)
+      (throw e))))
 
 (defn write-txn
-  "Run (f txn) in a write transaction and commit it; abort on exception."
+  "Run (f txn) in a write transaction and commit it; abort on exception. Inside
+  `transact`, f runs in its transaction, which commits when `transact` ends."
   [{:keys [env]} f]
-  (let [txn (begin env 0)]
-    (try
-      (let [r (f txn)]
-        (check "txn_commit" (mdb-txn-commit txn))
-        r)
-      (catch Throwable e
-        (mdb-txn-abort txn)
-        (throw e)))))
+  (if-some [t *txn*]
+    (f t)
+    (commit-or-abort (begin env 0) f)))
+
+(defn transact
+  "Run (f) with every read-txn and write-txn of this thread inside one write transaction:
+  committed when f returns, aborted when it throws. LMDB has one writer per env across
+  processes, so nothing interleaves with it. Answers f's value."
+  [{:keys [env]} f]
+  (if *txn*
+    (f)
+    (commit-or-abort (begin env 0) (fn [txn] (binding [*txn* txn] (f))))))
 
 (defn get-bytes
   "Value bytes for key k in txn, or nil."

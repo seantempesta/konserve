@@ -1,0 +1,35 @@
+(ns konserve.jolt.lmdb-test
+  "The LMDB store (Jolt only): konserve's compliance suite, and its transactions: an append
+  is one write transaction (PTransactBackingStore), and a transaction that throws leaves
+  nothing behind."
+  (:require [clojure.test :refer [deftest is testing]]
+            [konserve.core :as k]
+            [konserve.compliance-test :refer [compliance-test]]
+            [konserve.impl.storage-layout :as sl]
+            [konserve.jolt.lmdb :as lmdb]
+            [konserve.jolt.posix :as p]))
+
+(defn- with-store [f]
+  (let [path (str (System/getProperty "java.io.tmpdir") "/konserve-lmdb-test-" (random-uuid))
+        store (lmdb/connect-lmdb-store path :opts {:sync? true})]
+    (try (f store) (finally (lmdb/close-env! path) (clojure.java.shell/sh "rm" "-rf" path)))))
+
+(deftest lmdb-compliance
+  (with-store compliance-test))
+
+(deftest an-append-is-one-transaction
+  (with-store
+    (fn [store]
+      (is (satisfies? sl/PTransactBackingStore (:backing store)))
+      (k/append store :log 1 {:sync? true})
+      (testing "a transaction that throws after an append leaves the log as it was"
+        (is (thrown? Exception
+                     (sl/-transact (:backing store)
+                                   (fn [] (k/append store :log 2 {:sync? true}) (throw (ex-info "stop" {}))))))
+        (is (= [1] (k/log store :log {:sync? true}))))
+      (testing "inside one transaction several appends commit together"
+        (sl/-transact (:backing store) (fn [] (k/append store :log 2 {:sync? true}) (k/append store :log 3 {:sync? true})))
+        (is (= [1 2 3] (k/log store :log {:sync? true}))))
+      (testing "async appends too"
+        (is (= [1 2 3 4] (do (clojure.core.async/<!! (k/append store :log 4 {:sync? false}))
+                             (k/log store :log {:sync? true}))))))))

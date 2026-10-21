@@ -567,29 +567,45 @@
                          (throw e))
                        :cljs (throw e))))))))
 
+(defn- append-steps
+  "The append's read and three writes: the new element, the old last element's :next, the
+  head. Answers [first-id id]."
+  [store key elem opts]
+  (async+sync (:sync? opts)
+              *default-sync-translation*
+              (go-try-
+               (let [head (<?- (-get-in store [key] nil opts))
+                     [append-log? last-id first-id] head
+                     new-elem {:next nil
+                               :elem elem}
+                     id (hasch/uuid)]
+                 (when (and head (not= append-log? :append-log))
+                   (throw (ex-info "This is not an append-log." {:key key})))
+                 (<?- (-update-in store [id] (partial meta-update key :append-log) (fn [_] new-elem) opts))
+                 (when first-id
+                   (<?- (-update-in store [last-id :next] (partial meta-update key :append-log) (fn [_] id) opts)))
+                 (<?- (-update-in store [key] (partial meta-update key :append-log) (fn [_] [:append-log id (or first-id id)]) opts))
+                 [first-id id]))))
+
 (defn append
   "Append the Element to the log at the given key or create a new append log there.
-  This operation only needs to write the element and pointer to disk and hence is useful in write-heavy situations."
+  This operation only needs to write the element and pointer to disk and hence is useful in write-heavy situations.
+  On a backing store that runs transactions (PTransactBackingStore), the read and the three
+  writes are one transaction: atomic across processes, never left half done. Otherwise they
+  run under this process's lock on the key."
   ([store key elem]
    (append store key elem {:sync? false}))
   ([store key elem opts]
    (log/trace :konserve/append {:key key})
-   (async+sync (:sync? opts)
-               *default-sync-translation*
-               (go-locked
-                store key
-                (let [head (<?- (-get-in store [key] nil opts))
-                      [append-log? last-id first-id] head
-                      new-elem {:next nil
-                                :elem elem}
-                      id (hasch/uuid)]
-                  (when (and head (not= append-log? :append-log))
-                    (throw (ex-info "This is not an append-log." {:key key})))
-                  (<?- (-update-in store [id] (partial meta-update key :append-log) (fn [_] new-elem) opts))
-                  (when first-id
-                    (<?- (-update-in store [last-id :next] (partial meta-update key :append-log) (fn [_] id) opts)))
-                  (<?- (-update-in store [key] (partial meta-update key :append-log) (fn [_] [:append-log id (or first-id id)]) opts))
-                  [first-id id])))))
+   (let [backing (:backing store)]
+     (if (satisfies? storage-layout/PTransactBackingStore backing)
+       (let [run #(storage-layout/-transact backing (fn [] (append-steps store key elem (clojure.core/assoc opts :sync? true))))]
+         (if (:sync? opts) (run) (go-try- (run))))
+       (async+sync (:sync? opts)
+                   *default-sync-translation*
+                   (go-locked
+                    store key
+                    (<?- (append-steps store key elem opts))))))))
 
 (defn log
   "Loads the whole append log stored at key."
