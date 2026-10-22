@@ -1,0 +1,80 @@
+(ns konserve.jolt.lz4
+  "LZ4 frames over jolt.ffi and liblz4's frame API: the format konserve's JVM
+  Lz4Compressor writes (LZ4FrameOutputStream, 64 KiB blocks), so a value either
+  side compressed the other reads. A frame this side writes records its content
+  size, so reading it allocates exactly; a frame without one (the JVM's) is read
+  into a buffer grown as it fills."
+  (:require [jolt.ffi :as ffi]))
+
+(def lib-path
+  (or (System/getenv "JOLT_LZ4_LIB") "/opt/homebrew/lib/liblz4.dylib"))
+
+(ffi/load-library lib-path)
+
+(ffi/defcfn lz4f-bound "LZ4F_compressFrameBound" [:size_t :pointer] :size_t)
+(ffi/defcfn lz4f-compress "LZ4F_compressFrame" [:pointer :size_t :pointer :size_t :pointer] :size_t)
+(ffi/defcfn lz4f-error? "LZ4F_isError" [:size_t] :uint)
+(ffi/defcfn lz4f-error-name "LZ4F_getErrorName" [:size_t] :string)
+(ffi/defcfn lz4f-dctx-create "LZ4F_createDecompressionContext" [:pointer :uint] :size_t)
+(ffi/defcfn lz4f-dctx-free "LZ4F_freeDecompressionContext" [:pointer] :size_t)
+(ffi/defcfn lz4f-frame-info "LZ4F_getFrameInfo" [:pointer :pointer :pointer :pointer] :size_t)
+(ffi/defcfn lz4f-decompress "LZ4F_decompress" [:pointer :pointer :pointer :pointer :pointer :pointer] :size_t)
+
+(def ^:private LZ4F_VERSION 100)
+;; LZ4F_preferences_t: frameInfo {blockSizeID, blockMode, contentChecksumFlag,
+;; frameType (ints), contentSize (u64 at 16), dictID, blockChecksumFlag},
+;; compressionLevel, autoFlush, favorDecSpeed, reserved[3]: 56 bytes
+(def ^:private prefs-size 56)
+(def ^:private max64KB 4)
+
+(defn- check [op rc]
+  (when-not (zero? (lz4f-error? rc))
+    (throw (ex-info (str "lz4 " op ": " (lz4f-error-name rc)) {:op op :type :lz4-error})))
+  rc)
+
+(defn compress
+  "The LZ4 frame of src (a byte-array): 64 KiB blocks, its content size recorded."
+  ^bytes [^bytes src]
+  (let [n (alength src)
+        prefs (ffi/alloc prefs-size)
+        _ (ffi/write prefs :int max64KB 0)
+        _ (ffi/write prefs :uint64 n 16)
+        cap (lz4f-bound n prefs)
+        s (ffi/alloc (max 1 n))
+        d (ffi/alloc cap)]
+    (try (ffi/write-array s src)
+         (ffi/read-array d (check "compress" (lz4f-compress d cap s n prefs)))
+         (finally (ffi/free prefs) (ffi/free s) (ffi/free d)))))
+
+(defn decompress
+  "The content of the LZ4 frame src (a byte-array)."
+  ^bytes [^bytes src]
+  (let [n (alength src)
+        pp (ffi/alloc :pointer) info (ffi/alloc 32) ssz (ffi/alloc :size_t) dsz (ffi/alloc :size_t)
+        s (ffi/alloc (max 1 n))]
+    (try
+      (ffi/write-array s src)
+      (check "dctx" (lz4f-dctx-create pp LZ4F_VERSION))
+      (let [ctx (ffi/read pp :pointer)]
+        (try
+          (ffi/write ssz :size_t n)
+          (check "frame info" (lz4f-frame-info ctx info s ssz))
+          (let [used (ffi/read ssz :size_t)
+                known (ffi/read info :uint64 16)]
+            ;; each call consumes what it can of the rest of src into the rest of d;
+            ;; d doubles when it fills (only a frame without a content size)
+            (loop [d (ffi/alloc (max 64 known)) cap (max 64 known) out 0 in used]
+              (ffi/write dsz :size_t (- cap out))
+              (ffi/write ssz :size_t (- n in))
+              (let [hint (check "decompress" (lz4f-decompress ctx (ffi/slice d out) dsz (ffi/slice s in) ssz 0))
+                    out (+ out (ffi/read dsz :size_t))
+                    in (+ in (ffi/read ssz :size_t))]
+                (cond
+                  (zero? hint) (try (ffi/read-array d out) (finally (ffi/free d)))
+                  (< out cap) (recur d cap out in)
+                  :else (let [d2 (ffi/alloc (* 2 cap))]
+                          (ffi/write-array d2 (ffi/read-array d out))
+                          (ffi/free d)
+                          (recur d2 (* 2 cap) out in))))))
+          (finally (lz4f-dctx-free ctx))))
+      (finally (ffi/free pp) (ffi/free info) (ffi/free ssz) (ffi/free dsz) (ffi/free s)))))

@@ -1,7 +1,8 @@
 (ns konserve.compressor
   (:require [konserve.protocols :refer [PStoreSerializer -serialize -deserialize]]
             [konserve.utils :refer [invert-map]])
-  #?(:clj (:import [java.io ByteArrayInputStream InputStream]
+  #?(:jolt (:require [konserve.jolt.lz4 :as jlz4])
+     :clj (:import [java.io ByteArrayInputStream InputStream]
                     [net.jpountz.lz4 LZ4Factory LZ4SafeDecompressor
                      LZ4FrameOutputStream LZ4FrameOutputStream$BLOCKSIZE
                      LZ4FrameOutputStream$FLG LZ4FrameOutputStream$FLG$Bits LZ4FrameOutputStream$BD
@@ -157,7 +158,19 @@
        (frames-content! src dest)
        (ByteArrayInputStream. dest))))
 
-#?(:clj
+;; Jolt: the same frames through liblz4 (konserve.jolt.lz4): the serializer's
+;; bytes, compressed whole, written as one frame; read back whole.
+#?(:jolt
+   (defrecord Lz4Compressor [serializer]
+     PStoreSerializer
+     (-deserialize [_ read-handlers bytes]
+       (let [^bytes arr (if (bytes? bytes) bytes (.readAllBytes ^java.io.InputStream bytes))]
+         (-deserialize serializer read-handlers (jlz4/decompress arr))))
+     (-serialize [_ out write-handlers val]
+       (let [bos (java.io.ByteArrayOutputStream.)]
+         (-serialize serializer bos write-handlers val)
+         (.write ^java.io.OutputStream out ^bytes (jlz4/compress (.toByteArray bos))))))
+   :clj
    (defrecord Lz4Compressor [serializer]
      PStoreSerializer
      (-deserialize [_ read-handlers bytes]
@@ -199,7 +212,13 @@
          (when (< (alength compressed) (alength octets))
            compressed)))))
 
-#?(:clj
+#?(:jolt
+   (defn decompressing-stream
+     "An input stream of the octets `compress-octets` passed through
+     `compressor`: the frame read whole and decompressed."
+     ^java.io.InputStream [_compressor in]
+     (java.io.ByteArrayInputStream. (jlz4/decompress (.readAllBytes ^java.io.InputStream in))))
+   :clj
    (defn decompressing-stream
      "An input stream of the octets `compress-octets` passed through
      `compressor`, read from `in` as it is consumed, so a range read
@@ -214,7 +233,10 @@
 (defn unsupported-lz4-compressor [serializer]
   (UnsupportedLZ4Compressor. serializer))
 
-#?(:clj
+#?(:jolt
+   (defn lz4-compressor [serializer]
+     (Lz4Compressor. serializer))
+   :clj
    (defn lz4-compressor [serializer]
      (Lz4Compressor. serializer)))
 
@@ -229,7 +251,8 @@
 
 (def byte->compressor
   {0 null-compressor
-   1 #?(:clj (if (native-image-build?)
+   1 #?(:jolt lz4-compressor
+        :clj (if (native-image-build?)
                unsupported-lz4-compressor
                lz4-compressor)
         :cljs unsupported-lz4-compressor)})
@@ -239,6 +262,7 @@
 
 (defn get-compressor [type]
   (case type
-    :lz4 #?(:clj lz4-compressor
+    :lz4 #?(:jolt lz4-compressor
+            :clj lz4-compressor
             :cljs unsupported-lz4-compressor)
     null-compressor))
