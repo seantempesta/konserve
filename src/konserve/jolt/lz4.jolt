@@ -7,7 +7,9 @@
   (:require [jolt.ffi :as ffi]))
 
 (def lib-path
-  (or (System/getenv "JOLT_LZ4_LIB") "/opt/homebrew/lib/liblz4.dylib"))
+  "The liblz4 this process loads: JOLT_LZ4_LIB (an embedder builds its own and names it),
+  else the dynamic linker's search for liblz4.dylib."
+  (or (System/getenv "JOLT_LZ4_LIB") "liblz4.dylib"))
 
 (ffi/load-library lib-path)
 
