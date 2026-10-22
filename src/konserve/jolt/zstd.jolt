@@ -1,0 +1,55 @@
+(ns konserve.jolt.zstd
+  "zstd frames over jolt.ffi and libzstd's simple API: each value compressed whole as one
+  frame recording its content size, so reading it allocates exactly. Level 3, zstd's own
+  default (ZSTD_CLEVEL_DEFAULT): measured 2026-10-22 on Seon's stored values, levels 9 and 19
+  add 2-6% for several times the compression time."
+  (:require [jolt.ffi :as ffi]))
+
+(def lib-path
+  "The libzstd this process loads: JOLT_ZSTD_LIB (an embedder builds its own and names it),
+  else the dynamic linker's search for libzstd.dylib."
+  (or (System/getenv "JOLT_ZSTD_LIB") "libzstd.dylib"))
+
+(ffi/load-library lib-path)
+
+(ffi/defcfn zstd-bound "ZSTD_compressBound" [:size_t] :size_t)
+(ffi/defcfn zstd-compress "ZSTD_compress" [:pointer :size_t :pointer :size_t :int] :size_t)
+(ffi/defcfn zstd-content-size "ZSTD_getFrameContentSize" [:pointer :size_t] :size_t)
+(ffi/defcfn zstd-decompress "ZSTD_decompress" [:pointer :size_t :pointer :size_t] :size_t)
+(ffi/defcfn zstd-error? "ZSTD_isError" [:size_t] :uint)
+(ffi/defcfn zstd-error-name "ZSTD_getErrorName" [:size_t] :string)
+
+(def ^:private level 3)
+
+(defn- check [op rc]
+  (when-not (zero? (zstd-error? rc))
+    (throw (ex-info (str "zstd " op ": " (zstd-error-name rc)) {:op op :type :zstd-error})))
+  rc)
+
+(defn compress
+  "The zstd frame of src (a byte-array), its content size recorded."
+  ^bytes [^bytes src]
+  (let [n (alength src)
+        cap (zstd-bound n)
+        s (ffi/alloc (max 1 n))
+        d (ffi/alloc cap)]
+    (try (ffi/write-array s src)
+         (ffi/read-array d (check "compress" (zstd-compress d cap s n level)))
+         (finally (ffi/free s) (ffi/free d)))))
+
+(defn decompress
+  "The content of the zstd frame src (a byte-array), which records its content size (every
+  frame compress writes does)."
+  ^bytes [^bytes src]
+  (let [n (alength src)
+        s (ffi/alloc (max 1 n))]
+    (try
+      (ffi/write-array s src)
+      (let [size (zstd-content-size s n)]
+        ;; ZSTD_CONTENTSIZE_UNKNOWN (2^64-1) and _ERROR (2^64-2) read back as -1 and -2
+        (when (neg? size)
+          (throw (ex-info "zstd: a frame without its content size" {:type :zstd-error :op "content size" :code size})))
+        (let [d (ffi/alloc (max 1 size))]
+          (try (ffi/read-array d (check "decompress" (zstd-decompress d size s n)))
+               (finally (ffi/free d)))))
+      (finally (ffi/free s)))))

@@ -1,7 +1,7 @@
 (ns konserve.compressor
   (:require [konserve.protocols :refer [PStoreSerializer -serialize -deserialize]]
             [konserve.utils :refer [invert-map]])
-  #?(:jolt (:require [konserve.jolt.lz4 :as jlz4])
+  #?(:jolt (:require [konserve.jolt.lz4 :as jlz4] [konserve.jolt.zstd :as jzstd])
      :clj (:import [java.io ByteArrayInputStream InputStream]
                     [net.jpountz.lz4 LZ4Factory LZ4SafeDecompressor
                      LZ4FrameOutputStream LZ4FrameOutputStream$BLOCKSIZE
@@ -187,6 +187,19 @@
          (-serialize serializer lz4-byte write-handlers val)
          (.flush lz4-byte)))))
 
+;; Jolt: zstd frames through libzstd (konserve.jolt.zstd), the same shape: the serializer's
+;; bytes compressed whole as one frame, read back whole. Header byte 2.
+#?(:jolt
+   (defrecord ZstdCompressor [serializer]
+     PStoreSerializer
+     (-deserialize [_ read-handlers bytes]
+       (let [^bytes arr (if (bytes? bytes) bytes (.readAllBytes ^java.io.InputStream bytes))]
+         (-deserialize serializer read-handlers (jzstd/decompress arr))))
+     (-serialize [_ out write-handlers val]
+       (let [bos (java.io.ByteArrayOutputStream.)]
+         (-serialize serializer bos write-handlers val)
+         (.write ^java.io.OutputStream out ^bytes (jzstd/compress (.toByteArray bos)))))))
+
 ;; A binary value has no serializer: its bytes are the value. This identity
 ;; serializer lets a binary payload pass through a store compressor. It closes
 ;; the stream it writes to, so the compressor's frame is complete (Lz4Compressor
@@ -212,12 +225,15 @@
          (when (< (alength compressed) (alength octets))
            compressed)))))
 
+#?(:jolt (declare zstd-compressor))
+
 #?(:jolt
    (defn decompressing-stream
      "An input stream of the octets `compress-octets` passed through
-     `compressor`: the frame read whole and decompressed."
-     ^java.io.InputStream [_compressor in]
-     (java.io.ByteArrayInputStream. (jlz4/decompress (.readAllBytes ^java.io.InputStream in))))
+     `compressor`: the frame read whole and decompressed by its codec."
+     ^java.io.InputStream [compressor in]
+     (let [frame (.readAllBytes ^java.io.InputStream in)]
+       (java.io.ByteArrayInputStream. (if (= compressor zstd-compressor) (jzstd/decompress frame) (jlz4/decompress frame)))))
    :clj
    (defn decompressing-stream
      "An input stream of the octets `compress-octets` passed through
@@ -232,6 +248,10 @@
 
 (defn unsupported-lz4-compressor [serializer]
   (UnsupportedLZ4Compressor. serializer))
+
+#?(:jolt
+   (defn zstd-compressor [serializer]
+     (ZstdCompressor. serializer)))
 
 #?(:jolt
    (defn lz4-compressor [serializer]
@@ -255,13 +275,15 @@
         :clj (if (native-image-build?)
                unsupported-lz4-compressor
                lz4-compressor)
-        :cljs unsupported-lz4-compressor)})
+        :cljs unsupported-lz4-compressor)
+   #?@(:jolt [2 zstd-compressor])})
 
 (def compressor->byte
   (invert-map byte->compressor))
 
 (defn get-compressor [type]
   (case type
+    #?@(:jolt [:zstd zstd-compressor])
     :lz4 #?(:jolt lz4-compressor
             :clj lz4-compressor
             :cljs unsupported-lz4-compressor)
