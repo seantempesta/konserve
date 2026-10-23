@@ -91,6 +91,11 @@
 
 (defonce ^:private envs (atom {}))
 
+(defonce ^{:private true :doc "path -> how many konserve stores of this process hold its env
+  (connect-lmdb-store acquires, release-env! gives back): the env closes when the last does,
+  so a store made again at a path that was removed opens its own files, not the old mapping."}
+  holders (atom {}))
+
 (defn open-env!
   "The process's one env handle for directory path (LMDB forbids opening one
   env twice in a process)."
@@ -106,7 +111,26 @@
 (defn close-env! [path]
   (when-let [db (get @envs path)]
     (swap! envs dissoc path)
+    (swap! holders dissoc path)
     (l/close-env db)))
+
+(defn- acquire-env!
+  "open-env!, held by one more store of this process."
+  [path opts]
+  (locking envs
+    (let [db (open-env! path opts)]
+      (swap! holders update path (fnil inc 0))
+      db)))
+
+(defn release-env!
+  "One store of this process gives back path's env; the last one closes it. nil."
+  [path]
+  (locking envs
+    (let [n (dec (get @holders path 0))]
+      (if (pos? n)
+        (swap! holders assoc path n)
+        (close-env! path))))
+  nil)
 
 (defrecord BackingLmdb [db]
   PBackingStore
@@ -163,7 +187,7 @@
   "A konserve store in LMDB env directory `path`. Options as
   konserve.filestore/connect-fs-store plus :lmdb {:map-size :max-readers :flags}."
   [path & {:keys [config lmdb] :as params}]
-  (let [db (open-env! path lmdb)
+  (let [db (acquire-env! path lmdb)
         store-config (merge {:default-serializer :StringSerializer
                              :compressor null-compressor
                              :encryptor null-encryptor
