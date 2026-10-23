@@ -57,4 +57,4 @@
   (lmdb/close-env! path)
   (answer opts (jfs/delete-store path)))
 
-(defmethod ks/-release-store :lmdb [_ _ opts] (answer opts nil))
+(defmethod ks/-release-store :lmdb [{:keys [path]} _ opts] (lmdb/release-env! path) (answer opts nil))
