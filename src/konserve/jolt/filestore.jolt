@@ -166,3 +166,16 @@
                                             config)}
                             (dissoc params :config))]
     (connect-default-store (->BackingPosixFilestore path) store-config)))
+
+(defn store-opts
+  "The connect options a konserve.store config map carries (konserve.store's :file methods, and
+  konserve.jolt.store's :lmdb), as connect-fs-store and connect-lmdb-store take them."
+  [config opts]
+  (cond-> {:opts opts}
+    (:config config) (assoc :config (:config config))
+    (:default-serializer config) (assoc :default-serializer (:default-serializer config))))
+
+(defn connect-store
+  "The file store a konserve.store config map names ({:backend :file :path ...})."
+  [{:keys [path] :as config} opts]
+  (apply connect-fs-store path (mapcat identity (store-opts config opts))))

@@ -34,7 +34,8 @@
             [konserve.tiered :as tiered]
             [konserve.utils :refer [#?(:clj async+sync) *default-sync-translation*]
              #?@(:cljs [:refer-macros [async+sync]])]
-            #?(:clj [konserve.filestore])
+            #?(:jolt [konserve.jolt.filestore] :clj [konserve.filestore])
+            #?(:jolt [konserve.jolt.posix])
             [clojure.core.async :refer [go] :include-macros true]
             [superv.async :refer [go-try- <?-] :include-macros true]))
 
@@ -265,10 +266,38 @@
   ;; Don't remove from registry here; let create-store/delete-store handle it
   (if (:sync? opts) nil (go-try- nil)))
 
+;; ===== :file Backend on Jolt =====
+;; konserve.jolt.filestore: the same on-disk layout over POSIX calls (the JVM methods below need
+;; java.nio channels Jolt does not have; Jolt reads their :clj branch, so each is :jolt nil there)
+
+#?(:jolt
+   (defmethod -connect-store :file [{:keys [path] :as config} opts]
+     (when-not (konserve.jolt.posix/exists? path)
+       (throw (ex-info (str "File store does not exist at path: " path) {:path path :config config})))
+     (konserve.jolt.filestore/connect-store config opts)))
+
+#?(:jolt
+   (defmethod -create-store :file [{:keys [path] :as config} opts]
+     (when (konserve.jolt.posix/exists? path)
+       (throw (ex-info (str "File store already exists at path: " path) {:path path :config config})))
+     (konserve.jolt.filestore/connect-store config opts)))
+
+#?(:jolt
+   (defmethod -store-exists? :file [{:keys [path]} opts]
+     (let [exists (konserve.jolt.posix/exists? path)] (if (:sync? opts) exists (go-try- exists)))))
+
+#?(:jolt
+   (defmethod -delete-store :file [{:keys [path]} opts]
+     (let [res (konserve.jolt.filestore/delete-store path)] (if (:sync? opts) res (go-try- res)))))
+
+#?(:jolt
+   (defmethod -release-store :file [_config _store opts] (if (:sync? opts) nil (go-try- nil))))
+
 ;; ===== :file Backend (JVM only) =====
 ;; ClojureScript/Node.js :file backend is external - require konserve.node-filestore
 
-#?(:clj
+#?(:jolt nil
+   :clj
    (defmethod -connect-store :file
      [{:keys [path config filesystem] :as all-config} opts]
      (let [exists (konserve.filestore/store-exists? filesystem path)]
@@ -280,7 +309,8 @@
                                             :filesystem filesystem
                                             :opts opts))))
 
-#?(:clj
+#?(:jolt nil
+   :clj
    (defmethod -create-store :file
      [{:keys [path config filesystem] :as all-config} opts]
      (let [exists (konserve.filestore/store-exists? filesystem path)]
@@ -292,7 +322,8 @@
                                             :filesystem filesystem
                                             :opts opts))))
 
-#?(:clj
+#?(:jolt nil
+   :clj
    (defmethod -store-exists? :file
      [{:keys [path filesystem] :as config} opts]
      (let [exists (konserve.filestore/store-exists? filesystem path)]
@@ -300,13 +331,15 @@
          exists
          (go-try- exists)))))
 
-#?(:clj
+#?(:jolt nil
+   :clj
    (defmethod -delete-store :file
      [{:keys [path filesystem] :as config} opts]
      (let [res (konserve.filestore/delete-store filesystem path)]
        (if (:sync? opts) res (go-try- res)))))
 
-#?(:clj
+#?(:jolt nil
+   :clj
    (defmethod -release-store :file
      [_config _store opts]
      ;; File stores don't need cleanup, but return proper async type
