@@ -49,7 +49,8 @@
   rc)
 
 (defn open-env
-  "Open (creating) the env directory `path`. Answers {:env ptr :dbi n :path}."
+  "Open (creating) the env directory `path`. Answers {:env ptr :dbi n :path :open?}, :open? an atom
+  close-env sets false."
   [path {:keys [map-size max-readers flags] :or {map-size (* 1024 1024 1024) max-readers 126 flags 0}}]
   (let [pp (ffi/alloc :pointer)]
     (try
@@ -65,11 +66,26 @@
             (check "dbi_open" (mdb-dbi-open txn nil 0 dp))
             (let [dbi (ffi/read dp :uint32)]
               (check "txn_commit" (mdb-txn-commit txn))
-              {:env env :dbi dbi :path path})
+              {:env env :dbi dbi :path path :open? (atom true)})
             (finally (ffi/free dp)))))
       (finally (ffi/free pp)))))
 
-(defn close-env [{:keys [env]}] (mdb-env-close env))
+(defn close-env
+  "Close the env. Every transaction begun on it after answers :lmdb-env-closed (live-env):
+  a db value whose store was released reads its nodes lazily, and a read of a closed env's
+  map is an invalid memory reference that kills the process."
+  [{:keys [env open?]}]
+  (reset! open? false)
+  (mdb-env-close env))
+
+(defn- live-env
+  "The env pointer of db, or the typed error when its env was closed (close-env): the store
+  was released or deleted, and its values are read before that."
+  [{:keys [env open? path]}]
+  (when-not @open?
+    (throw (ex-info (str "lmdb env closed: " path " (its store was released; read a value before its last release)")
+                    {:type :lmdb-env-closed :path path})))
+  env)
 
 (defn- begin [env flags]
   (let [pp (ffi/alloc :pointer)]
@@ -102,10 +118,10 @@
 
 (defn read-txn
   "Run (f txn) in a read-only transaction (in `transact`'s, when one is open)."
-  [{:keys [env]} f]
+  [db f]
   (if-some [t *txn*]
     (f t)
-    (let [txn (begin env MDB_RDONLY)]
+    (let [txn (begin (live-env db) MDB_RDONLY)]
       (try (f txn) (finally (mdb-txn-abort txn))))))
 
 (defn- commit-or-abort [txn f]
@@ -120,19 +136,19 @@
 (defn write-txn
   "Run (f txn) in a write transaction and commit it; abort on exception. Inside
   `transact`, f runs in its transaction, which commits when `transact` ends."
-  [{:keys [env]} f]
+  [db f]
   (if-some [t *txn*]
     (f t)
-    (commit-or-abort (begin env 0) f)))
+    (commit-or-abort (begin (live-env db) 0) f)))
 
 (defn transact
   "Run (f) with every read-txn and write-txn of this thread inside one write transaction:
   committed when f returns, aborted when it throws. LMDB has one writer per env across
   processes, so nothing interleaves with it. Answers f's value."
-  [{:keys [env]} f]
+  [db f]
   (if *txn*
     (f)
-    (commit-or-abort (begin env 0) (fn [txn] (binding [*txn* txn] (f))))))
+    (commit-or-abort (begin (live-env db) 0) (fn [txn] (binding [*txn* txn] (f))))))
 
 (defn get-bytes
   "Value bytes for key k in txn, or nil."
@@ -183,13 +199,13 @@
           (finally (mdb-cursor-close cur))))
       (finally (ffi/free buf)))))
 
-(defn sync! [{:keys [env]}] (check "env_sync" (mdb-env-sync env 1)))
+(defn sync! [db] (check "env_sync" (mdb-env-sync (live-env db) 1)))
 
 (defn reader-check
   "Clear stale reader slots of dead processes; answers the count cleared."
-  [{:keys [env]}]
+  [db]
   (let [p (ffi/alloc :int32)]
-    (try (check "reader_check" (mdb-reader-check env p)) (ffi/read p :int32)
+    (try (check "reader_check" (mdb-reader-check (live-env db) p)) (ffi/read p :int32)
          (finally (ffi/free p)))))
 
 (defn compact-copy!
@@ -197,7 +213,7 @@
   data.mdb): mdb_env_copy2 with MDB_CP_COMPACT, which writes only the pages in use, in
   order, so freed pages (a sweep's deletions) leave the file. The copy reads one
   snapshot: commits made while it runs are not in it. nil."
-  [{:keys [env]} ^String dst]
+  [db ^String dst]
   (let [p (ffi/string->ptr dst)]
-    (try (check "env_copy2" (mdb-env-copy2 env p MDB_CP_COMPACT))
+    (try (check "env_copy2" (mdb-env-copy2 (live-env db) p MDB_CP_COMPACT))
          (finally (ffi/free p)))))
