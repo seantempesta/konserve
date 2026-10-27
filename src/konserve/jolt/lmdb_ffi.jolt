@@ -73,7 +73,8 @@
 (defn close-env
   "Close the env. Every transaction begun on it after answers :lmdb-env-closed (live-env):
   a db value whose store was released reads its nodes lazily, and a read of a closed env's
-  map is an invalid memory reference that kills the process."
+  map is an invalid memory reference that kills the process. A close racing a transaction
+  another thread already began is not covered: the caller closes after its reads."
   [{:keys [env open?]}]
   (reset! open? false)
   (mdb-env-close env))
