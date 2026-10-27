@@ -2,7 +2,8 @@
   "The LMDB store (Jolt only): konserve's compliance suite, and its transactions: an append
   is one write transaction (PTransactBackingStore), and a transaction that throws leaves
   nothing behind."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.java.shell]
+            [clojure.test :refer [deftest is testing]]
             [konserve.core :as k]
             [konserve.compliance-test :refer [compliance-test]]
             [konserve.impl.storage-layout :as sl]
