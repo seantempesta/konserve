@@ -178,6 +178,20 @@
           (check "put" (mdb-put txn dbi kv dv 0))
           (finally (ffi/free vb)))))))
 
+(defn put-parts!
+  "Put parts (byte-arrays) under key k in txn as one value, their bytes written in order into the value's
+  buffer: what put-bytes! of their concatenation writes, without the concatenated copy."
+  [{:keys [dbi]} txn k parts]
+  (with-key k
+    (fn [kv dv]
+      (let [n (reduce + 0 (map #(alength ^bytes %) parts))
+            vb (ffi/alloc (max 1 n))]
+        (try
+          (reduce (fn [at ^bytes p] (ffi/write-array (+ vb at) p) (+ at (alength p))) 0 parts)
+          (set-val! dv n vb)
+          (check "put" (mdb-put txn dbi kv dv 0))
+          (finally (ffi/free vb)))))))
+
 (defn del! [{:keys [dbi]} txn k]
   (with-key k (fn [kv _] (let [rc (mdb-del txn dbi kv ffi/null)]
                            (if (= rc MDB_NOTFOUND) false (do (check "del" rc) true))))))
