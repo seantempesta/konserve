@@ -168,7 +168,7 @@
     (sync-or-go env
                 (l/write-txn db (fn [txn]
                                   (into {} (for [[sk {:keys [header meta value]}] store-key-values]
-                                             (do (l/put-bytes! db txn sk (concat-bytes header meta value))
+                                             (do (l/put-parts! db txn sk [header meta value])
                                                  [sk true])))))))
   (-multi-delete-blobs [_ store-keys env]
     (sync-or-go env

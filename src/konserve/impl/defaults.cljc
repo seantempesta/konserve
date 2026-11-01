@@ -114,6 +114,25 @@
          [input meta])
        :cljs [input meta])))
 
+#?(:jolt
+   (def ^:private fasl-bytes (delay (requiring-resolve 'konserve.jolt.fasl-store/serialize))))
+
+#?(:jolt
+   (defn- direct-bytes
+     "The bytes serializer chain ser writes for value, made without an output stream, when every link of the
+     chain is one this knows (no encryption; zstd, lz4 or no compression; fasl): the same bytes, each link's
+     made once. Through ByteArrayOutputStreams a value's bytes were copied six times or more (each stream's
+     buffer doubles, then toByteArray), 1.05 MB for a commit's 18 index nodes against 0.58 MB this way.
+     nil for any other chain, which the streams write."
+     [ser value]
+     (condp instance? ser
+       konserve.encryptor.NullEncryptor (direct-bytes (:serializer ser) value)
+       konserve.compressor.NullCompressor (direct-bytes (:serializer ser) value)
+       konserve.compressor.ZstdCompressor (some-> (direct-bytes (:serializer ser) value) konserve.jolt.zstd/compress)
+       konserve.compressor.Lz4Compressor (some-> (direct-bytes (:serializer ser) value) konserve.jolt.lz4/compress)
+       konserve.serializers.FaslSerializer (@fasl-bytes value)
+       nil)))
+
 (defn update-blob
   "This function writes first the meta-size, then the meta-data and then the
   actual updated data into the underlying backing store."
@@ -128,6 +147,15 @@
           to-array #?(:cljs
                       (fn [value]
                         (-serialize ((encryptor  (:encryptor config)) (compressor serializer)) nil write-handlers value))
+                      :jolt
+                      (let [ser ((encryptor (:encryptor config)) (compressor serializer))]
+                        (fn [value]
+                          (or (direct-bytes ser value)
+                              (let [bos (ByteArrayOutputStream.)]
+                                (try (-serialize ser bos write-handlers value)
+                                     (.toByteArray bos)
+                                     (finally
+                                       (.close bos)))))))
                       :clj
                       (fn [value]
                         (let [bos (ByteArrayOutputStream.)]
@@ -518,6 +546,15 @@
           to-array #?(:cljs
                       (fn [value]
                         (-serialize ((encryptor  (:encryptor config)) (compressor serializer)) nil write-handlers value))
+                      :jolt
+                      (let [ser ((encryptor (:encryptor config)) (compressor serializer))]
+                        (fn [value]
+                          (or (direct-bytes ser value)
+                              (let [bos (ByteArrayOutputStream.)]
+                                (try (-serialize ser bos write-handlers value)
+                                     (.toByteArray bos)
+                                     (finally
+                                       (.close bos)))))))
                       :clj
                       (fn [value]
                         (let [bos (ByteArrayOutputStream.)]
