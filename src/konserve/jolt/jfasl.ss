@@ -110,7 +110,8 @@
       (let loop ((s (jolt-seq s)))
         (unless (jolt-nil? s)
           (w (seq-first s))
-          (loop (seq-more s))))
+          ;; the next seq, never seq-more's rest as it is: a realized seq's rest ends in (), not nil
+          (loop (jolt-seq (seq-more s)))))
       (u8! 21))
     (define (rec! x)
       (let* ((d (jrec-desc x)) (tag (jrdesc-tag d)) (h (hashtable-ref kjc-handlers tag #f)))

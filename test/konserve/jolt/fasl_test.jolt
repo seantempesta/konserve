@@ -67,3 +67,8 @@
   (let [[x y] (rt [(->H 1 :k) (->H 2 :k)])]
     (is (instance? H y))
     (is (= [1 :k 2 :k] [(.-a x) (.-b x) (.-a y) (.-b y)]))))
+
+;; a seq whose rest ends in (), not nil (a realized map over a list): it is walked to its end, never past it
+(deftest a-lazy-seq-from-map-round-trips
+  (is (= (quote (1)) (rt (map identity (list 1)))))
+  (is (= (quote (1 2)) (rt (doall (map inc (concat [0] [1] ())))))))
