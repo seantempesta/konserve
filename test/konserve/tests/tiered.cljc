@@ -6,7 +6,66 @@
             [konserve.protocols :as protocols]
             [konserve.tiered :as tiered]
             [konserve.compliance-test :refer [async-compliance-test] :as ct]
-            [superv.async :refer [<?-]]))
+            [superv.async :refer [go-try- <?-]]))
+
+(defn- failing-assoc-store [backend-store failure]
+  (reify protocols/PEDNKeyValueStore
+    (-exists? [_ key opts]
+      (protocols/-exists? backend-store key opts))
+    (-get-meta [_ key opts]
+      (protocols/-get-meta backend-store key opts))
+    (-get-in [_ key-vec not-found opts]
+      (protocols/-get-in backend-store key-vec not-found opts))
+    (-update-in [_ key-vec meta-up-fn up-fn opts]
+      (protocols/-update-in backend-store key-vec meta-up-fn up-fn opts))
+    (-assoc-in [_ _key-vec _meta-up-fn _val _opts]
+      (go-try- (throw failure)))
+    (-dissoc [_ key opts]
+      (protocols/-dissoc backend-store key opts))))
+
+(defn- failing-fill-store
+  "A frontend whose cache fill fails: konserve.tiered/warm! fills through
+   -update-in, so both writes fail."
+  [frontend-store failure]
+  (reify protocols/PEDNKeyValueStore
+    (-exists? [_ key opts]
+      (protocols/-exists? frontend-store key opts))
+    (-get-meta [_ key opts]
+      (protocols/-get-meta frontend-store key opts))
+    (-get-in [_ key-vec not-found opts]
+      (protocols/-get-in frontend-store key-vec not-found opts))
+    (-update-in [_ _key-vec _meta-up-fn _up-fn _opts]
+      (go-try- (throw failure)))
+    (-assoc-in [_ _key-vec _meta-up-fn _val _opts]
+      (go-try- (throw failure)))
+    (-dissoc [_ key opts]
+      (protocols/-dissoc frontend-store key opts))))
+
+(defn test-awaited-read-through-async
+  "An awaited miss is not complete until its frontend is populated, and a fill
+   failure is reported to that caller instead of being detached and logged."
+  [frontend-store backend-store]
+  (go
+    (<?- (k/dissoc frontend-store :awaited-read))
+    (<?- (k/assoc backend-store :awaited-read {:v 1}))
+    (let [store (<?- (tiered/connect-tiered-store frontend-store backend-store
+                                                  :read-policy :frontend-first))]
+      (is (= {:v 1}
+             (<?- (k/get store :awaited-read nil
+                         {:sync? false :await-read-through? true}))))
+      (is (= {:v 1} (<?- (k/get frontend-store :awaited-read)))
+          "the awaited read returns only after the frontend contains the value"))
+
+    (testing "an awaited cache-fill failure belongs to the read"
+      (<?- (k/dissoc frontend-store :awaited-read))
+      (let [failure (ex-info "deliberate awaited fill failure" {:test true})
+            broken-frontend (failing-fill-store frontend-store failure)
+            store (<?- (tiered/connect-tiered-store broken-frontend backend-store
+                                                    :read-policy :frontend-first))
+            result (<! (k/get store :awaited-read nil
+                              {:sync? false :await-read-through? true}))]
+        (is (= "deliberate awaited fill failure" (ex-message result)))
+        (is (= {:test true} (ex-data result)))))))
 
 #?(:clj
    (defn test-tiered-compliance-sync [frontend-store backend-store]
@@ -143,7 +202,9 @@
          (is (= [nil "found-it"] (<! (k/assoc-in deepest-store [:deep-secret] "found-it"))))
          (is (false? (<! (k/exists? middle-store :deep-secret))) "Should not be in middle tier yet")
          (is (false? (<! (k/exists? frontend-store :deep-secret))) "Should not be in frontend yet")
-         (is (= "found-it" (<! (k/get-in top-store [:deep-secret]))) "Should retrieve value from deepest store")
+         (is (= "found-it" (<! (k/get-in top-store [:deep-secret]
+                                         nil {:sync? false :await-read-through? true})))
+             "Should retrieve and completely hydrate from the deepest store")
          (is (true? (<! (k/exists? frontend-store :deep-secret))) "Value should now be in frontend store")
          ;; Verify write hook on middle tier
          (let [[val port] (alts! [hook-promise (timeout 2000)])]
@@ -178,6 +239,64 @@
         (is (nil? (<?- (k/get-in frontend-store [:test-key]))))
         (is (= {:value 44} (<?- (k/get-in backend-store [:test-key]))))
         (is (= {:value 44} (<?- (k/get-in store [:test-key]))))))))
+
+(defn test-write-behind-receipts-async [frontend-store backend-store]
+  (go
+    (testing "a receipt reports backend durability without changing the write result"
+      (let [store (<?- (tiered/connect-tiered-store frontend-store backend-store
+                                                    :write-policy :write-behind))
+            {:keys [opts receipt]} (tiered/with-write-behind-receipt)
+            write-result (<?- (k/assoc store :receipted {:value 45} opts))
+            outcome (<! receipt)]
+        (is (= [nil {:value 45}] write-result))
+        (is (= :succeeded (:status outcome)))
+        (is (= [nil {:value 45}] (:result outcome)))
+        (is (= {:value 45} (<?- (k/get backend-store :receipted))))))
+
+    (testing "receipts cover update, binary, and atomic multi-key writes"
+      (let [{update-opts :opts update-receipt :receipt}
+            (tiered/with-write-behind-receipt)
+            store (<?- (tiered/connect-tiered-store frontend-store backend-store
+                                                    :write-policy :write-behind))]
+        (<?- (k/update store :receipted #(update % :value inc) update-opts))
+        (is (= :succeeded (:status (<! update-receipt))))
+        (let [{binary-opts :opts binary-receipt :receipt}
+              (tiered/with-write-behind-receipt)
+              bytes #?(:clj (byte-array [1 2 3]) :cljs #js [1 2 3])]
+          (<?- (k/bassoc store :receipt-binary bytes binary-opts))
+          (is (= :succeeded (:status (<! binary-receipt)))))
+        (let [{multi-opts :opts multi-receipt :receipt}
+              (tiered/with-write-behind-receipt)]
+          (<?- (k/multi-assoc store {:receipt-a 1 :receipt-b 2} multi-opts))
+          (is (= :succeeded (:status (<! multi-receipt)))))))
+
+    (testing "a receipt exposes a detached backend failure"
+      (let [failure (ex-info "deliberate backend failure" {:test true})
+            failing-backend (failing-assoc-store backend-store failure)
+            store (<?- (tiered/connect-tiered-store frontend-store failing-backend
+                                                    :write-policy :write-behind))
+            {:keys [opts receipt]} (tiered/with-write-behind-receipt)
+            write-result (<?- (k/assoc store :receipt-failure {:value 46} opts))
+            outcome (<! receipt)]
+        (is (= [nil {:value 46}] write-result)
+            "the frontend write remains low latency and successful")
+        (is (= :failed (:status outcome)))
+        (is (= "deliberate backend failure" (ex-message (:error outcome))))
+        (is (= {:test true} (ex-data (:error outcome))))))
+
+    #?(:clj
+       (testing "a synchronous frontend write still has an asynchronous receipt"
+         (let [store (tiered/connect-tiered-store frontend-store backend-store
+                                                  :write-policy :write-behind
+                                                  :opts {:sync? true})
+               {:keys [opts receipt]}
+               (tiered/with-write-behind-receipt {:sync? true})
+               write-result (k/assoc store :sync-receipt {:value 47} opts)
+               outcome (<! receipt)]
+           (is (= [nil {:value 47}] write-result))
+           (is (= :succeeded (:status outcome)))
+           (is (= {:value 47}
+                  (k/get backend-store :sync-receipt nil {:sync? true}))))))))
 
 (defn test-frontend-only-async
   "Cache mode: :frontend-only writes + :frontend-first reads. Writes/deletes land in

@@ -4,6 +4,32 @@ All notable, user-visible changes to konserve are documented here.
 
 ## Unreleased
 
+### Fixed
+- **Connecting to an existing IndexedDB store opens it again.** The previous
+  fix (connect no longer writes) skipped `-create-store` for a store that
+  already exists — and for the IndexedDB backing, `-create-store` *is* the open:
+  `indexedDB.open` both creates and opens, and the handle it yields is what
+  every later transaction needs. A reconnect to an existing store therefore
+  left the handle nil, and the first access failed with "Cannot read properties
+  of null (reading 'transaction')" — every datahike-in-the-browser reconnect.
+  Backings whose create is also their open now implement the optional
+  `PBackingOpen` (`-open-store`), which connect calls for an existing store;
+  `-create-store` still runs only for a missing one, so the read-only
+  existing-store path is preserved for object-store backings.
+- **Connecting to an existing store no longer writes.** `connect-default-store`
+  called `-create-store` unconditionally on every connect — "auto-create on
+  connect" implemented as "create on connect". On an object-store backing that
+  is a PUT of the store marker, so every connect to an EXISTING store performed
+  a write it had no reason to perform: a reader holding read-only credentials
+  could not connect at all, and (measured against S3 in
+  replikativ/datahike-serverless#6) a cold datahike tenant open cost 2 PUTs —
+  it probes and then connects, writing the marker twice — where the correct
+  number is zero. Connect now probes `-store-exists?` first and creates only
+  what is missing: the existing-store path is a HEAD/stat, read-only
+  credentials work, and auto-create is untouched for a missing store. The
+  first-connect race is benign and no worse than before — `-create-store` has
+  always had to be idempotent, since until now it ran on every connect.
+
 ### Added
 - **Conditional writes (`:expected-revision`), with an explicit capability.** A
   write can now be made conditional on the revision the caller read: it lands
@@ -107,6 +133,36 @@ All notable, user-visible changes to konserve are documented here.
   being switched to the high one.
 
 ### Fixed
+- **`multi-get`, `multi-dissoc` and a copy-and-rename layout no longer drop
+  `:expected-revision` silently.** Three ways the option could be asked for and
+  not honoured, each of which now raises instead:
+
+  - `multi-get` forwarded it to the backing. A read cannot be fenced, so on its
+    own that is merely meaningless — but a backing that fences ITSELF has to
+    remember, for the duration of one conditional write, the metadata konserve
+    read under the lock, because `-sync` runs on a different blob record than the
+    read did. `multi-get` takes no per-key lock and closes no rows, so such a
+    read looked exactly like the read belonging to an in-flight fenced write and
+    replaced the metadata that write was about to compare against. Reproduced on
+    konserve-jdbc: the fenced write reported SUCCESS and overwrote the value that
+    had committed in between.
+  - `multi-dissoc` forwarded it into `-multi-delete-blobs`, where every backing
+    ignores it, so a caller asking for a fenced batch delete was told it
+    happened. `multi-assoc` has always refused; this is the same rule.
+  - A backing that declares `PSelfConditionalWrite` now LOSES its domain when the
+    store is configured `:in-place? false`. That layout writes `<store-key>.new`
+    and renames it into place, so the storage layer's precondition is evaluated
+    against a key that by construction does not exist — every such write is a
+    create, and creates succeed — while the rename that follows compares nothing.
+    A lock-based claim is unaffected and must be: there konserve holds the lock
+    and evaluates the revision itself, across the write and the rename, which is
+    how the filestore (`:in-place? false` by default) is fenced correctly.
+
+  Every released self-fencing backend sets `:in-place? true`, so no default
+  deployment was affected; `connect-default-store`'s own default is `false`, and
+  a caller's `:config` is merged over a backend's, so the guarantee rested on a
+  flag rather than on anything structural.
+
 - **Compression combined with encryption never worked.** The read path nested
   the wrappers the opposite way round from the write path, so it tried to
   *decompress ciphertext*: `zstd` + `aes` failed with "Unknown frame

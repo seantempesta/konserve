@@ -598,6 +598,21 @@
    (multi-get store keys {:sync? false}))
   ([store keys opts]
    (log/trace :konserve/multi-get {:key-count (count keys)})
+   ;; A READ cannot be fenced, and forwarding the option here is not merely
+   ;; useless — it is dangerous. A backing that fences itself has to remember, for
+   ;; the duration of one conditional write, the metadata konserve read under the
+   ;; lock, because `-sync` runs on a different blob record than the read did.
+   ;; `multi-get` takes no per-key lock and closes nothing, so a multi-read
+   ;; carrying `:expected-revision` looked to such a backing exactly like the read
+   ;; belonging to an in-flight fenced write — and replaced the metadata that
+   ;; write was about to compare against with metadata that had overtaken it.
+   ;; Reproduced on JDBC before this: the fenced write reported SUCCESS and
+   ;; overwrote the value that had committed in between.
+   ;;
+   ;; The backings can and do defend themselves by narrowing what may deposit,
+   ;; but the option has no meaning on this path at all, so refusing it here
+   ;; removes the whole class rather than one instance of it.
+   (refuse-conditional-unsupported! "multi-get" opts)
    (when-not (multi-key-capable? store)
      (throw (#?(:clj ex-info :cljs js/Error.) "Store does not support multi-key operations"
                                               #?(:clj {:store-type (type store)
@@ -668,9 +683,16 @@
                     {:type :konserve/conditional-multi-write-unsupported}))))
 
 (defn multi-assoc
-  "Associates multiple key-value pairs with flat keys, as one batch. Atomically where the
-  backend can (IndexedDB); ordered everywhere (see below), which is the weaker guarantee
-  that actually suffices.
+  "Associates multiple key-value pairs with flat keys, as ONE ATOMIC BATCH.
+
+  ONLY AVAILABLE WHERE THE BACKEND CAN APPLY IT ATOMICALLY. A store that cannot
+  refuses — `multi-key-capable?` is false and this throws — rather than degrading to
+  a sequence of individual writes. That is deliberate: a caller reaching for
+  `multi-assoc` is asking for all-or-nothing, and a partial batch presented as a
+  successful one is the kind of silent corruption no caller can detect afterwards.
+  Today that means IndexedDB (object-store transactions), DynamoDB
+  (`TransactWriteItems`), Redis (`MULTI`/`EXEC`) and JDBC (a database transaction);
+  object stores and filesystems cannot, so they do not offer it.
 
   `kvs` is either a map, or — preferred when the batch has internal dependencies — an
   ORDERED sequence of `[k v]` pairs. **Sequence order is apply order**, and it is preserved
@@ -678,24 +700,26 @@
   write-hook (so a sync layer can relay the batch in the same order). A map has no order,
   so a map batch makes no ordering promise.
 
-  Why that matters: not every backend can write multiple keys atomically (S3, filesystems
-  cannot; IndexedDB can). For a batch that writes a set of immutable, content-addressed
-  values plus a MUTABLE pointer that makes them reachable, you do not need atomicity — you
-  need order. Put the pointer LAST:
+  IF YOUR STORE CANNOT DO THIS, do not look for a weaker version of it here — write the
+  batch yourself with ordinary `assoc` calls, in order. For a batch of immutable,
+  content-addressed values plus a MUTABLE pointer that makes them reachable, ordering is
+  enough and atomicity is not needed. Put the pointer LAST:
 
   ```
   (multi-assoc store [[node-a v] [node-b v] [:root {:refs [node-a node-b]}]]
                (uniform-meta [node-a node-b] {:immutable? true}))
   ```
 
-  Then any prefix of the batch leaves the store consistent: the values are written but
-  unreachable (harmless orphans, collectable), and the pointer flips only once everything it
-  references exists. A torn batch can never produce a dangling pointer. This is the
-  write-the-leaves-then-flip-the-root discipline, and it is what lets non-atomic backends be
-  crash-safe.
+  Then any prefix leaves the store consistent: the values are written but unreachable
+  (harmless orphans, collectable), and the pointer flips only once everything it
+  references exists. A torn sequence can never produce a dangling pointer. This is the
+  write-the-leaves-then-flip-the-root discipline, and it is what lets a caller be
+  crash-safe on a backend with no atomic batch at all.
 
-  Atomic backends still apply the batch all-or-nothing, in which case the order is simply
-  redundant — passing an ordered seq is always safe.
+  That discipline is the CALLER'''s to apply, not a guarantee this function makes on a
+  non-atomic store. Order is still preserved here — sequence order is apply order, and it
+  reaches the write-hook verbatim — but on an atomic backend the ordering is simply
+  redundant.
 
   Returns a map of keys to results (typically true for each key).
 
@@ -831,6 +855,13 @@
    (multi-dissoc store keys {:sync? false}))
   ([store keys opts]
    (log/trace :konserve/multi-dissoc {:key-count (count keys)})
+   ;; `multi-assoc` has always refused this; `multi-dissoc` forwarded it into
+   ;; `-multi-delete-blobs`, where every backing ignores it — so a caller asking
+   ;; for a fenced batch delete was told it happened. Same reasoning as
+   ;; `refuse-conditional-multi!`: checking every key and then deleting every key
+   ;; is not one step, so the guarantee could not be honoured even by a backing
+   ;; that wanted to. Refusing is recoverable; silently dropping it is not.
+   (refuse-conditional-unsupported! "multi-dissoc" opts)
    (when-not (multi-key-capable? store)
      (throw (#?(:clj ex-info :cljs js/Error.) "Store does not support multi-key operations"
                                               #?(:clj {:store-type (type store)

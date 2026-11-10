@@ -104,6 +104,40 @@
           "and still readable")
       (delete-store folder))))
 
+(deftest a-failed-revision-read-must-not-leak-the-sidecar-lock
+  (testing "a revision-bearing READ takes the sidecar before it takes the value
+            blob lock. If the latter acquisition fails, both the sidecar lock and
+            its channel still have to be released; otherwise one failed head read
+            wedges the mutable pointer for the lifetime of this JVM."
+    (let [folder "/tmp/konserve-fs-revision-read-lock-leak"
+          _      (delete-store folder)
+          store  (<!! (connect-fs-store folder))]
+      (k/assoc store :head {:v 1} {:sync? true})
+      (k/get store :head nil {:sync? true :with-revision? true})
+      (let [ksv (first (filter #(and (str/ends-with? % ".ksv")
+                                     (not (str/ends-with? % ".ksv.cas")))
+                               (map str (.list (java.io.File. folder)))))
+            ch  (FileChannel/open (Paths/get (str folder "/" ksv) (into-array String []))
+                                  (into-array StandardOpenOption
+                                              [StandardOpenOption/CREATE StandardOpenOption/WRITE]))
+            l   (.lock ch)]
+        (try
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (k/get store :head nil {:sync? true :with-revision? true}))
+              "the contended revision read reaches the transient failure path")
+          (finally (.release l) (.close ch))))
+      (let [[value revision]
+            (k/get store :head nil {:sync? true :with-revision? true})]
+        (is (= {:v 1} value)
+            "the sidecar was released and a subsequent fenced read succeeds")
+        (is (some? revision) "and still returns its fencing token"))
+      (is (= :wrote (deref (future (try (k/assoc store :head {:v 2} {:sync? true})
+                                        :wrote
+                                        (catch Throwable e (ex-message e))))
+                           20000 :timed-out-holding-the-lock))
+          "the key remains writable too")
+      (delete-store folder))))
+
 (deftest every-writer-to-a-fenceable-key-takes-the-sidecar
   (testing "the fence must exclude UNCONDITIONAL writers too, or it is not a
             fence. A plain write renames a new inode over the key; a fenced write
@@ -205,8 +239,19 @@
     (let [folder "/tmp/konserve-fs-selffence-test"
           _      (delete-store folder)
           store  (<!! (connect-fs-store folder :config {:lock-blob? false}))
+          ;; `:in-place? true` alongside the swapped backing, because that is the
+          ;; configuration a self-fencing backend actually ships — and since
+          ;; konserve#176 it is part of what makes the claim valid. The filestore
+          ;; itself defaults to `:in-place? false`, which is fine for ITS fence
+          ;; (konserve holds the lock across the write and the rename) but not for
+          ;; a backing that evaluates the condition inside `-sync`: there the
+          ;; condition would be evaluated against `<key>.new` and the rename would
+          ;; compare nothing. What this test is about — `:lock-blob?` must not
+          ;; disarm a self-fencing backing — is unchanged.
           self   (fn [domain]
-                   (clojure.core/assoc store :backing
+                   (clojure.core/assoc store
+                                       :config (clojure.core/assoc (:config store) :in-place? true)
+                                       :backing
                                        (reify konserve.protocols/PConditionalWrite
                                          (-conditional-write-domain [_] domain)
                                          konserve.protocols/PSelfConditionalWrite)))]
@@ -228,7 +273,9 @@
       (k/get store :fenced nil {:sync? true :with-revision? true})
       (is (= 1 (count (cas-of))) "konserve-lock backing: sidecar")
       ;; the same store with a self-fencing backing gets none
-      (let [self-store (clojure.core/assoc store :backing
+      (let [self-store (clojure.core/assoc store
+                                           :config (clojure.core/assoc (:config store) :in-place? true)
+                                           :backing
                                            (reify konserve.protocols/PConditionalWrite
                                              (-conditional-write-domain [_] :machine)
                                              konserve.protocols/PSelfConditionalWrite))]

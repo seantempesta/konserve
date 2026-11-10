@@ -20,7 +20,8 @@
                                              PMultiKeyEDNValueStore
                                              PWriteHookStore]]
    #?(:jolt [clojure.core] :clj [konserve.nio-helpers :as nio])
-   [konserve.impl.storage-layout :refer [-streaming-binary-write? -atomic-move -create-store
+   [konserve.impl.storage-layout :refer [-streaming-binary-write? -atomic-move -create-store -store-exists?
+                                         PBackingOpen -open-store
                                          -copy -create-blob -delete-blob -blob-exists?
                                          -keys -sync-store
                                          -migratable -migrate -handle-foreign-key
@@ -594,26 +595,36 @@
               ;; flag itself, so testing the operation is both correct and the only
               ;; thing available here.
               cas-blob (when (and (= :read-edn-meta operation) lock-based-fencing?)
-                         (<?- (-create-blob backing cas-store-key env)))
-              cas-lock (when cas-blob
-                         (log/trace :konserve/acquiring-cas-lock {:key key})
-                         (<?- (get-lock cas-blob (first key-vec) env)))
-              blob (<?- (-create-blob backing store-key env))
-              lock (when (:lock-blob? config)
-                     (log/trace :konserve/acquiring-blob-lock {:key key :blob (str blob)})
-                     (<?- (get-lock blob (first key-vec) env)))]
+                         (<?- (-create-blob backing cas-store-key env)))]
+          ;; Keep each acquisition INSIDE the try that releases the preceding
+          ;; resource. A failure opening or locking the value blob must not strand
+          ;; the sidecar's JVM-wide FileLock; one leaked revision read otherwise
+          ;; wedges every later read and write of this key until the JVM exits.
           (try
-            (<?- (read-blob blob read-handlers serializers env))
-            (catch #?(:clj Exception :cljs js/Error) e
-              (if (store-key-not-found? e) (:not-found env) (throw e)))
+            (let [cas-lock (when cas-blob
+                             (log/trace :konserve/acquiring-cas-lock {:key key})
+                             (<?- (get-lock cas-blob (first key-vec) env)))]
+              (try
+                (let [blob (<?- (-create-blob backing store-key env))]
+                  (try
+                    (let [lock (when (:lock-blob? config)
+                                 (log/trace :konserve/acquiring-blob-lock {:key key :blob (str blob)})
+                                 (<?- (get-lock blob (first key-vec) env)))]
+                      (try
+                        (<?- (read-blob blob read-handlers serializers env))
+                        (catch #?(:clj Exception :cljs js/Error) e
+                          (if (store-key-not-found? e) (:not-found env) (throw e)))
+                        (finally
+                          (when lock
+                            (log/trace :konserve/releasing-blob-lock
+                                       {:key (first key-vec) :blob (str blob)})
+                            (<?- (-release lock env))))))
+                    (finally
+                      (<?- (-close blob env)))))
+                (finally
+                  (when cas-lock (<?- (-release cas-lock env))))))
             (finally
-              (when (:lock-blob? config)
-                (log/trace :konserve/releasing-blob-lock {:key (first key-vec) :blob (str blob)})
-                (<?- (-release lock env)))
-              (<?- (-close blob env))
-              (when cas-lock
-                (<?- (-release cas-lock env))
-                (<?- (-close cas-blob env))))))
+              (when cas-blob (<?- (-close cas-blob env))))))
 
         (and (not store-key-exists?) migration-key)
         (<?- (-migrate backing migration-key key-vec serializer read-handlers write-handlers env))
@@ -1145,8 +1156,22 @@
       ;; happened to be global — see `PSelfConditionalWrite` for the stores that
       ;; fence themselves without reaching that far, which the old test would have
       ;; silently disarmed.
+      ;; `:in-place?` revokes a SELF-fenced claim, and only that kind. The
+      ;; storage layer evaluates the precondition inside `-sync`, but under
+      ;; `:in-place? false` `update-blob` syncs to `<store-key>.new` and then
+      ;; renames it into place — so the comparison is made against a key that by
+      ;; construction does not exist (every such write is a create, and creates
+      ;; succeed), and the `-atomic-move` that follows compares nothing at all. A
+      ;; caller would be told its conditional write landed while no condition was
+      ;; ever evaluated.
+      ;;
+      ;; A LOCK-based claim survives that layout, which is why this is not
+      ;; hoisted out of the branch: there konserve holds the lock and evaluates
+      ;; `check-revision!` itself, across the write AND the rename. The filestore
+      ;; is `:in-place? false` by default and is fenced correctly; moving this
+      ;; test above the `if` would silently disarm it.
       (if (satisfies? protocols/PSelfConditionalWrite backing)
-        declared
+        (when (:in-place? config) declared)
         (when (:lock-blob? config) declared))))
   (-revision [this key opts]
     (async+sync (:sync? opts) *default-sync-translation*
@@ -1452,7 +1477,31 @@
         (throw (ex-info "You need to activate file-locking for in-place mode."
                         {:type :store-configuration-error
                          :config complete-config}))
-        (let [_                  (<?- (-create-store backing opts))
+        (let [;; ENSURE means make-it-so, not write-regardless. This used to
+              ;; call `-create-store` unconditionally on every connect, which on
+              ;; an object-store backing is a PUT of the store marker — so every
+              ;; connect to an EXISTING store performed a write it had no reason
+              ;; to perform. Two practical consequences, both measured against
+              ;; S3 (replikativ/datahike-serverless#6): a reader holding
+              ;; read-only credentials could not connect at all, and a cold
+              ;; open cost 2 PUTs (datahike probes and then connects, so the
+              ;; marker was written twice) where the correct number is zero.
+              ;;
+              ;; Probing first makes the existing-store path READ-ONLY — a
+              ;; HEAD/stat instead of a write — while auto-create semantics are
+              ;; untouched for a missing store. The first-connect race is
+              ;; benign and no worse than before: two concurrent creators both
+              ;; write a marker whose content is constant, and `-create-store`
+              ;; has always had to be idempotent — until this change it ran on
+              ;; EVERY connect.
+              ;; A backing whose create IS its open (IndexedDB sets its db
+              ;; handle in -create-store) still has to open an existing store:
+              ;; skipping create there left the handle nil and every later
+              ;; transaction failed. `PBackingOpen` is the read-only half.
+              _                  (if (<?- (-store-exists? backing opts))
+                                   (when (satisfies? PBackingOpen backing)
+                                     (<?- (-open-store backing opts)))
+                                   (<?- (-create-store backing opts)))
               store              (map->DefaultStore {:backing             backing
                                                      :default-serializer  default-serializer
                                                      :serializers         (merge key->serializer serializers)
