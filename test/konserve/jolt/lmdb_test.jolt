@@ -6,7 +6,9 @@
             [clojure.test :refer [deftest is testing]]
             [konserve.core :as k]
             [konserve.compliance-test :refer [compliance-test]]
+            [konserve.impl.defaults]
             [konserve.impl.storage-layout :as sl]
+            [konserve.jolt.filestore :as jfs]
             [konserve.jolt.lmdb :as lmdb]
             [konserve.jolt.posix :as p]))
 
@@ -34,3 +36,23 @@
       (testing "async appends too"
         (is (= [1 2 3 4] (do (clojure.core.async/<!! (k/append store :log 4 {:sync? false}))
                              (k/log store :log {:sync? true}))))))))
+
+(deftest a-connect-in-the-canonical-shape-warns-of-nothing
+  ;; konserve.impl.defaults/normalize-store-config logs each old spelling it is handed. Our
+  ;; stores' own defaults are none of them, so a caller who names nothing, or names its
+  ;; encoding under :config :encoding, is warned of nothing; the old spelling still is.
+  (let [seen (atom [])
+        tmp #(str (System/getProperty "java.io.tmpdir") "/konserve-canon-test-" (random-uuid))
+        lmdb! (fn [& params] (let [path (tmp)]
+                               (try (apply lmdb/connect-lmdb-store path :opts {:sync? true} params)
+                                    (finally (lmdb/close-env! path) (clojure.java.shell/sh "rm" "-rf" path)))))
+        fs! (fn [& params] (let [path (tmp)]
+                             (try (apply jfs/connect-fs-store path :opts {:sync? true} params)
+                                  (finally (clojure.java.shell/sh "rm" "-rf" path)))))]
+    (with-redefs [konserve.impl.defaults/deprecated! (fn [from _] (swap! seen conj from))]
+      (lmdb!) (fs!)
+      (lmdb! :config {:encoding {:serializer :StringSerializer :compressor {:type :lz4}}})
+      (fs! :config {:encoding {:serializer :StringSerializer}})
+      (is (= [] @seen))
+      (lmdb! :default-serializer :StringSerializer)
+      (is (= [:default-serializer] @seen)))))

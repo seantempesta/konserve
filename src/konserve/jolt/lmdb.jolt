@@ -15,8 +15,6 @@
              :refer [PBackingStore PBackingBlob PBackingLock PReadMissSafe
                      PMultiWriteBackingStore PMultiReadBackingStore PTransactBackingStore header-size
                      store-key-not-found-ex]]
-            [konserve.compressor :refer [null-compressor]]
-            [konserve.encryptor :refer [null-encryptor]]
             [konserve.jolt.lmdb-ffi :as l]
             [konserve.jolt.posix :as p]
             [konserve.jolt.filestore :refer [default-encoding input->bytes]]
@@ -183,11 +181,7 @@
   konserve.filestore/connect-fs-store plus :lmdb {:map-size :max-readers :flags}."
   [path & {:keys [config lmdb] :as params}]
   (let [db (acquire-env! path lmdb)
-        store-config (merge {:compressor null-compressor
-                             :encryptor null-encryptor
-                             :read-handlers (atom {})
-                             :write-handlers (atom {})
-                             :buffer-size (* 1024 1024)
+        store-config (merge {:buffer-size (* 1024 1024)
                              :opts {:sync? false}
                              :config (merge {:sync-blob? false :in-place? true :no-backup? true
                                              :lock-blob? true}
