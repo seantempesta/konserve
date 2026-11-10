@@ -19,7 +19,7 @@
                                PMultiKeySupport
                                PMultiKeyEDNValueStore
                                PWriteHookStore]]
-   #?(:clj [konserve.nio-helpers :as nio])
+   #?(:jolt [clojure.core] :clj [konserve.nio-helpers :as nio])
    [konserve.impl.storage-layout :refer [-streaming-binary-write? -atomic-move -create-store
                                          -copy -create-blob -delete-blob -blob-exists?
                                          -keys -sync-store
@@ -204,7 +204,7 @@
           (<?- (-write-binary new-blob meta-size
                               (if (-streaming-binary-write? new-blob)
                                 input
-                                #?(:clj (nio/blob->bytes input) :cljs input))
+                                #?(:jolt input :clj (nio/blob->bytes input) :cljs input))
                               env))
           (let [value-arr (to-array value)]
             (<?- (-write-value new-blob value-arr meta-size env))))

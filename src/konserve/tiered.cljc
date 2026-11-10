@@ -2,7 +2,7 @@
   "Tiered store implementation with frontend and backend storage layers."
   (:refer-clojure :exclude [get get-in update update-in assoc assoc-in exists? dissoc keys])
   (:require [clojure.core.async :refer [go] :as async]
-            #?(:clj [konserve.nio-helpers :as nio])
+            #?(:jolt [clojure.core] :clj [konserve.nio-helpers :as nio])
             [clojure.set :as set]
             [konserve.memory :as memory]
             [konserve.protocols :as protocols :refer [-exists? -get-meta -get-in -assoc-in
@@ -361,7 +361,7 @@
     ;; tier would then store nothing, silently. `bassoc` documents streams as
     ;; input, so this is the only place that can honour that for a two-tier
     ;; write.
-    (let [val #?(:clj (nio/blob->bytes val) :cljs val)]
+    (let [val #?(:jolt val :clj (nio/blob->bytes val) :cljs val)]
       (async+sync (:sync? opts)
                   *default-sync-translation*
                   (go-try-

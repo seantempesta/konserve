@@ -6,7 +6,7 @@
                                         PBinaryKeyValueStore PKeyIterable
                                         PMultiKeyEDNValueStore PMultiKeySupport
                                         PAssocSerializers PWriteHookStore]]
-            #?(:clj [konserve.nio-helpers :as nio])
+            #?(:jolt [clojure.core] :clj [konserve.nio-helpers :as nio])
             [konserve.utils #?(:clj :refer :cljs :refer-macros) [async+sync]]))
 
 ;; =============================================================================
@@ -96,7 +96,7 @@
     ;; then read a String as a FILENAME. The DefaultStore backings normalize in
     ;; `konserve.impl.defaults`; this store bypasses that layer, so it does its
     ;; own.
-    (let [input #?(:clj (nio/blob->bytes input) :cljs input)
+    (let [input #?(:jolt input :clj (nio/blob->bytes input) :cljs input)
           {:keys [sync?]} opts]
       (async+sync sync?
                   {go do
