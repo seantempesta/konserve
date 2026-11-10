@@ -5,7 +5,7 @@
    [clojure.string :refer [includes? ends-with?]]
    [konserve.compressor :refer [null-compressor decompressing-stream]]
    [konserve.encryptor :refer [null-encryptor]]
-   [konserve.impl.defaults :refer [update-blob connect-default-store key->store-key store-key->uuid-key]]
+   [konserve.impl.defaults :refer [update-blob connect-default-store key->store-key store-key->uuid-key normalize-store-config]]
    [konserve.impl.storage-layout :refer [PBackingStore PDataSyncBackingStore -deferred-sync?
                                          -create-blob -delete-blob -blob-exists?
                                          -atomic-move -sync-store
@@ -817,6 +817,14 @@
   The :filesystem option allows using a custom java.nio.file.FileSystem (e.g., Jimfs for testing).
   When provided, all path operations will use that filesystem instead of the default.
 
+  Compression and encryption are set UNDER :config, as a type keyword:
+
+      (connect-fs-store path :config {:compressor {:type :lz4}})
+
+  A top-level :compressor/:encryptor is refused rather than ignored -- it used
+  to be silently dropped, leaving the store uncompressed while the caller
+  believed otherwise.
+
   Defaults are
   {:base           path
    :serializer     fressian-serializer
@@ -833,18 +841,37 @@
                 filesystem nil}
            :as params}]
   ;; check config
-  (let [store-config (merge {:default-serializer :FressianSerializer
-                             :compressor         null-compressor
-                             :encryptor          null-encryptor
-                             :read-handlers      (atom {})
-                             :write-handlers     (atom {})
-                             :buffer-size        (* 1024 1024)
-                             :opts               {:sync? false}
-                             :config             (merge {:sync-blob? true
-                                                         :in-place? false
-                                                         :lock-blob? true}
-                                                        config)}
-                            (dissoc params :config :filesystem))
+  ;; NO :compressor / :encryptor here. They were defaults that
+  ;; `connect-default-store` never read -- it derives both from
+  ;; `(get-in config [:compressor :type])` -- so they were dead, and worse,
+  ;; they made a top-level `:compressor` look supported when passing one did
+  ;; nothing at all. That path now throws; see connect-default-store.
+  ;; CANONICAL SHAPE. The codec group lives under `:config :encoding` -- see
+  ;; `konserve.impl.defaults/normalize-store-config`. Emitting it here rather
+  ;; than the old spellings is what makes the deprecation warnings mean
+  ;; something: konserve's own defaults would otherwise trip them on every
+  ;; connect, for every caller, whatever they wrote.
+  (let [;; NORMALISE THE CALLER FIRST, then fill defaults into the gaps.
+        ;; Order matters and got this wrong once: applying our own
+        ;; `:encoding {:serializer :FressianSerializer}` default before
+        ;; normalising meant a caller's older `:default-serializer
+        ;; :BoringSerializer` found the slot already taken and was dropped --
+        ;; reintroducing the exact silent-override bug this shape exists to
+        ;; end. Caught by the old-spelling test asserting header byte 3.
+        store-config (-> (dissoc params :filesystem)
+                         (assoc :config (or config {}))
+                         normalize-store-config
+                         (update :config #(merge {:sync-blob? true
+                                                  :in-place? false
+                                                  :lock-blob? true}
+                                                 %))
+                         (update-in [:config :encoding]
+                                    #(merge {:serializer     :FressianSerializer
+                                             :read-handlers  (atom {})
+                                             :write-handlers (atom {})}
+                                            %))
+                         (update :buffer-size #(or % (* 1024 1024)))
+                         (update :opts #(or % {:sync? false})))
         detect-old-blob (when detect-old-file-schema?
                           (atom (detect-old-file-schema filesystem path)))
         _                  (when detect-old-file-schema?
