@@ -1,6 +1,6 @@
 (ns konserve.filestore
   (:require
-   [clojure.core.async :refer [go <!! chan close! put!]]
+   [clojure.core.async :refer [go <! <!! chan close! put! timeout]]
    [clojure.java.io :as io]
    [clojure.string :refer [includes? ends-with?]]
    [konserve.compressor :refer [null-compressor decompressing-stream]]
@@ -86,12 +86,26 @@
    Note: Jimfs doesn't support directory sync via FileChannel, so we skip it."
   ([base] (sync-base nil base))
   ([filesystem base]
-   ;; Only sync directories on the default filesystem (Jimfs doesn't support this)
+   ;; Only sync directories on the default filesystem (Jimfs doesn't support this).
+   ;;
+   ;; Tolerant of a directory that cannot be opened. fsync-ing a DIRECTORY is a
+   ;; POSIX durability step for a just-renamed entry; Windows has no such
+   ;; operation, and `FileChannel/open` on a directory there throws
+   ;; AccessDeniedException whose whole message is the path. NTFS journals its
+   ;; metadata, so skipping the sync loses nothing that was available. Before
+   ;; this, `delete-store` on Windows failed with a bare
+   ;; "target\\native-image-tests" — the PARENT path, since the parent is what
+   ;; gets synced after an entry is removed — which was diagnosable only by
+   ;; reading the exception class datahike's CLI did not print.
+   ;; Only the OPEN is tolerated, and only its Windows shape. A `force` that
+   ;; fails on a directory that did open (EIO on POSIX) is the durability loss
+   ;; this sync exists to surface, and propagates; `with-open` closes the
+   ;; channel either way.
    (when-not filesystem
-     (let [p (get-path filesystem base)
-           fc (FileChannel/open p (into-array OpenOption []))]
-       (.force fc true)
-       (.close fc)))))
+     (when-let [fc (try (FileChannel/open (get-path filesystem base) (into-array OpenOption []))
+                        (catch java.nio.file.AccessDeniedException _ nil))]
+       (with-open [^FileChannel fc fc]
+         (.force fc true))))))
 
 (defn- check-and-create-backing-store
   "Helper Function to Check if Base is not writable"
@@ -130,18 +144,23 @@
            (.close ds))
          (Files/delete base-path))
        (when parent-path
+         ;; Return nil, not the exception: a Throwable returned as a VALUE is
+         ;; put on the go-try- channel and re-thrown by the caller's <?-, so
+         ;; this catch never swallowed anything. sync-base is tolerant now
+         ;; anyway; the guard stays against anything else it could raise.
          (try
            (sync-base filesystem (str parent-path))
-           (catch Exception e e))))
+           (catch Exception _ nil))))
      ;; For default filesystem, use io/file
      (let [f           (io/file base)
            parent-base (.getParent f)]
        (doseq [c (.list (io/file base))]
          (.delete (io/file (str base "/" c))))
        (.delete f)
+       ;; nil, not e — see the custom-filesystem branch above.
        (try
          (sync-base parent-base)
-         (catch Exception e e))))))
+         (catch Exception _ nil))))))
 
 (defn list-files
   "Lists all files on the first level of a directory."
@@ -180,6 +199,42 @@
 
 (declare migrate-old-files migrate-file-v2 migrate-file-v1
          read-binary-range*)
+
+(defn- write-fully!
+  "Write every remaining byte of `buffer` at `pos`.
+
+   A positional write may return short — the count it returns is the only
+   thing that says so — and a write that stops early leaves the tail of the
+   region unwritten. Every caller here used to ignore that count."
+  [^FileChannel ch ^ByteBuffer buffer ^long pos]
+  (loop [p pos]
+    (when (.hasRemaining buffer)
+      (recur (+ p (long (.write ch buffer p)))))))
+
+(defn- write-fully-async
+  "`write-fully!` for an AsynchronousFileChannel: a channel that closes once
+   every remaining byte is written, or carries the error. Re-issues from the
+   completed count, which is what the three hand-written completion handlers
+   this replaces never looked at."
+  [^AsynchronousFileChannel ch ^ByteBuffer buffer ^long pos msg]
+  (let [out (chan)]
+    (letfn [(step [^long p]
+              (if (.hasRemaining buffer)
+                (.write ch buffer p nil
+                        (proxy [CompletionHandler] []
+                          (completed [n _] (step (+ p (long n))))
+                          (failed [t _]
+                            (put! out (ex-info "Could not write key file."
+                                               (assoc msg :exception t)))
+                            (close! out))))
+                (close! out)))]
+      (step pos))
+    out))
+
+(def ^:private max-move-attempts
+  "Upper bound on `-atomic-move` retries against a Windows AccessDenied — about
+   a second of jittered waiting, the same budget `get-lock` gives contention."
+  60)
 
 (defrecord BackingFilestore [base detected-old-blobs ephemeral? filesystem]
   konserve.protocols/PConditionalWrite
@@ -247,10 +302,28 @@
   (-atomic-move [_this from to env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
-                 (Files/move (get-path filesystem base from)
-                             (get-path filesystem base to)
-                             (into-array [StandardCopyOption/ATOMIC_MOVE
-                                          StandardCopyOption/REPLACE_EXISTING])))))
+                 (let [src  (get-path filesystem base from)
+                       dst  (get-path filesystem base to)
+                       opts (into-array [StandardCopyOption/ATOMIC_MOVE
+                                         StandardCopyOption/REPLACE_EXISTING])]
+                   ;; Retried on AccessDeniedException, for Windows. POSIX renames
+                   ;; over a file that another process still has open; Windows
+                   ;; refuses until every handle on the target is gone. Our own
+                   ;; handle is closed before this is called (see the write path
+                   ;; in impl.defaults), so what remains is a READER in another
+                   ;; process, which is short-lived — hence a bounded wait rather
+                   ;; than an immediate failure. Bounded, because a handle held
+                   ;; indefinitely should surface as the error it is.
+                   (loop [attempt 0]
+                     (let [denied (try (Files/move src dst opts) nil
+                                       (catch java.nio.file.AccessDeniedException e e))]
+                       (when denied
+                         (if (< attempt max-move-attempts)
+                           (do (if (:sync? env)
+                                 (Thread/sleep (long (+ 5 (rand-int 20))))
+                                 (<! (timeout (+ 5 (rand-int 20)))))
+                               (recur (inc attempt)))
+                           (throw denied)))))))))
   (-create-store [_this env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
@@ -379,70 +452,36 @@
   (-close [this _env] (go-try- (.close this)))
   (-get-lock [this _env] (go-try- (.get (.lock this))))
   (-write-header [this header env]
-    (let [{:keys [msg]} env
-          ch (chan)
-          buffer (ByteBuffer/wrap header)]
-      (.write this buffer 0 header-size
-              (proxy [CompletionHandler] []
-                (completed [_res _att]
-                  (close! ch))
-                (failed [t _att]
-                  (put! ch (ex-info "Could not write key file."
-                                    (assoc msg :exception t)))
-                  (close! ch))))
-      ch))
+    (write-fully-async this (ByteBuffer/wrap header) 0 (:msg env)))
   (-write-meta [this meta-arr env]
-    (let [{:keys [msg]} env
-          ch (chan)
-          meta-size (alength ^bytes meta-arr)
-          buffer (ByteBuffer/wrap meta-arr)]
-      (.write this buffer header-size (+ header-size meta-size)
-              (proxy [CompletionHandler] []
-                (completed [_res _att]
-                  (close! ch))
-                (failed [t _att]
-                  (put! ch (ex-info "Could not write key file."
-                                    (assoc msg :exception t)))
-                  (close! ch))))
-      ch))
+    (write-fully-async this (ByteBuffer/wrap meta-arr) header-size (:msg env)))
   (-write-value [this value-arr meta-size env]
-    (let [{:keys [msg]} env
-          ch (chan)
-          total-size (.size this)
-          buffer (ByteBuffer/wrap value-arr)]
-      (.write this buffer (+ header-size meta-size) total-size
-              (proxy [CompletionHandler] []
-                (completed [_res _att]
-                  (close! ch))
-                (failed [t _att]
-                  (put! ch (ex-info "Could not write key file."
-                                    (assoc msg :exception t)))
-                  (close! ch))))
-      ch))
+    (let [start (+ header-size meta-size)
+          end   (+ start (alength ^bytes value-arr))]
+      (go-try-
+       (<?- (write-fully-async this (ByteBuffer/wrap value-arr) start (:msg env)))
+       ;; The value is the last segment, so the file ends here. Without this a
+       ;; shorter value written over a longer one keeps the old tail — reachable
+       ;; in `:in-place?` mode, where the file is reused.
+       (.truncate this (long end))
+       nil)))
   (-write-binary [this meta-size blob env]
     (let [{:keys [msg buffer-size]} env
           [bis read] (blob->channel blob buffer-size)
-          buffer     (ByteBuffer/allocate buffer-size)
-          start      (+ header-size meta-size)
-          stop       (+ buffer-size start)]
+          buffer     (ByteBuffer/allocate buffer-size)]
       (go-try-
-       (loop [start-byte start
-              stop-byte  stop]
-         (let [size   (read bis buffer)
-               _      (.flip buffer)
-               ch (chan)]
-           (when-not (= size -1)
-             (.write this buffer start-byte stop-byte
-                     (proxy [CompletionHandler] []
-                       (completed [_res _att]
-                         (.clear buffer)
-                         (close! ch))
-                       (failed [t _att]
-                         (put! ch (ex-info "Could not write key file."
-                                           (assoc msg :exception t)))
-                         (close! ch))))
-             (<?- ch)
-             (recur (+ buffer-size start-byte) (+ buffer-size stop-byte)))))
+       ;; Advance by what the read actually PUT in the buffer, not by its
+       ;; capacity: a channel read may return short at any point, and a fixed
+       ;; stride then leaves a hole and shifts everything after it.
+       (loop [pos (+ header-size meta-size)]
+         (let [size (read bis buffer)]
+           (.flip buffer)
+           (if (= size -1)
+             (.truncate this (long pos))
+             (let [n (.remaining buffer)]
+               (<?- (write-fully-async this buffer pos msg))
+               (.clear buffer)
+               (recur (+ pos n))))))
        (catch Exception e
          (log/trace :konserve/write-binary-error {:error e})
          e)
@@ -526,29 +565,30 @@
   (-close [this _env] (.close this))
   (-get-lock [this _env] (.lock this))
   (-write-header [this header _env]
-    (let [buffer (ByteBuffer/wrap header)]
-      (.write this buffer 0)))
+    (write-fully! this (ByteBuffer/wrap header) 0))
   (-write-meta [this meta-arr _env]
-    (let [buffer (ByteBuffer/wrap meta-arr)]
-      (.write this buffer header-size)))
+    (write-fully! this (ByteBuffer/wrap meta-arr) header-size))
   (-write-value [this value-arr meta-size _env]
-    (let [buffer (ByteBuffer/wrap value-arr)]
-      (.write this buffer (+ header-size meta-size))))
+    (let [start (+ header-size meta-size)]
+      (write-fully! this (ByteBuffer/wrap value-arr) start)
+      ;; See the async twin: the value is the last segment.
+      (.truncate this (long (+ start (alength ^bytes value-arr))))
+      nil))
   (-write-binary [this meta-size blob env]
     (let [{:keys [buffer-size]} env
           [bis read] (blob->channel blob buffer-size)
-          buffer     (ByteBuffer/allocate buffer-size)
-          start      (+ header-size meta-size)
-          stop       (+ buffer-size start)]
+          buffer     (ByteBuffer/allocate buffer-size)]
       (try
-        (loop [start-byte start
-               stop-byte  stop]
-          (let [size   (read bis buffer)
-                _      (.flip buffer)]
-            (when-not (= size -1)
-              (.write this buffer start-byte)
-              (.clear buffer)
-              (recur (+ buffer-size start-byte) (+ buffer-size stop-byte)))))
+        ;; See the async twin: advance by what was buffered, not the capacity.
+        (loop [pos (+ header-size meta-size)]
+          (let [size (read bis buffer)]
+            (.flip buffer)
+            (if (= size -1)
+              (.truncate this (long pos))
+              (let [n (.remaining buffer)]
+                (write-fully! this buffer pos)
+                (.clear buffer)
+                (recur (+ pos n))))))
         (finally
           (.close ^Closeable bis)))))
   (-read-header [this _env]

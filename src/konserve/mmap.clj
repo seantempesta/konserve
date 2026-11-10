@@ -104,11 +104,11 @@
                                      " at " (.getPath f))
                                 {:type :konserve/key-not-found :key key
                                  :path (.getPath f)})))
-        hdr   (or (read-header f)
-                  (throw (ex-info (str "konserve.mmap: " (.getPath f) " is shorter "
-                                       "than a " header-size "-byte header")
-                                  {:type :konserve/malformed-blob
-                                   :path (.getPath f) :size (.length f)})))
+        ^bytes hdr (or (read-header f)
+                       (throw (ex-info (str "konserve.mmap: " (.getPath f) " is shorter "
+                                            "than a " header-size "-byte header")
+                                       {:type :konserve/malformed-blob
+                                        :path (.getPath f) :size (.length f)})))
         [_ sb cb eb] (map #(bit-and (aget hdr (int %)) 0xff) (range 4))]
     ;; All three are refused rather than worked around -- see the namespace
     ;; docstring on why a silent fallback would be worse than an error.
@@ -429,11 +429,15 @@
   the atomic rename is only crash-DURABLE, not merely crash-atomic, once the
   directory entry is synced."
   [^String fpath]
+  ;; Same tolerance as filestore/sync-base, for the same reason: Windows cannot
+  ;; open a directory as a channel, and has no directory fsync to skip.
   (let [dir (.getParent (File. fpath))]
     (when dir
-      (with-open [fc (FileChannel/open (path-of dir)
-                                       (into-array OpenOption []))]
-        (.force fc true)))))
+      (try
+        (with-open [fc (FileChannel/open (path-of dir)
+                                         (into-array OpenOption []))]
+          (.force fc true))
+        (catch java.io.IOException _ nil)))))
 
 (defn- splice-write!
   "Transform the value region of `fpath` (bytes from `voff` to EOF) with `xform`
