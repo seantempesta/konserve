@@ -4,7 +4,36 @@ All notable, user-visible changes to konserve are documented here.
 
 ## Unreleased
 
+### Added
+- **Authenticated encryption with `:aes-gcm`.** AES-256-GCM encrypts complete
+  serialized metadata and value segments, with fresh per-segment salt and
+  associated data binding ciphertext to its layout version, key and slot.
+  `konserve.core/seal` / `unseal` provide the same protection for
+  materialized binary payloads; streaming binary remains explicitly raw.
+- **`konserve.protocols/PEncryptor`.** Encryption is separated from streaming
+  serialization so authentication completes before plaintext is decoded.
+- **Metrics, without wrapping a store.** `konserve.metrics` reports every
+  operation to a process-wide registry of sinks — `(add-sink! id f)` /
+  `(remove-sink! id)`, each a `(fn [event])` — at three levels: `:api` (what
+  a caller waits for, per public function), `:io` (the backend's own work per
+  blob operation, below the lock — the S3 round trip, the fsync — with the
+  bytes a write serialized), and `:lock` (the wait for the in-process key
+  lock). Events carry the store's `:backend` and `:store-id`, which
+  `connect-store`/`create-store` now also stamp, namespaced, into a
+  `DefaultStore`'s `:config`. No store changes identity or type, every
+  backend on `DefaultStore` is covered, a throwing sink is logged and never
+  fails an operation, and with no sink the cost is one deref per measurement
+  site.
+
 ### Fixed
+- **A throwing write hook never reaches the writer.** Hooks run after the write
+  has committed, but the catch covered `Exception` only (JVM) and `js/Error`
+  only (CLJS), so an `Error` such as core.async's `AssertionError` on an
+  overfull channel, or a thrown non-Error value, escaped into the caller of a
+  write that had succeeded. Any throwable is now logged and the remaining
+  hooks still run.
+- **IndexedDB now honors caller encoding configuration.** Its connect helper no
+  longer discards the nested encryptor/compressor configuration.
 - **Connecting to an existing IndexedDB store opens it again.** The previous
   fix (connect no longer writes) skipped `-create-store` for a store that
   already exists — and for the IndexedDB backing, `-create-store` *is* the open:

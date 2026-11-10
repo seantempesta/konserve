@@ -347,6 +347,30 @@
        (finally
          (async/put! cache-lock :unlocked))))))
 
+(defn ^:private invalidate-frontend!
+  "Fire-and-forget frontend invalidation for one key. Returns the `go` channel, which every
+   caller discards — the write-around policies do not wait for the frontend to catch up.
+
+   A TOP-LEVEL fn rather than a `go` inlined in the record's method bodies: an inner `go`
+   macroexpands into a complete state machine, and the enclosing `go-try-` then runs
+   core.async's ioc transform over a body containing all of that generated code — measured at
+   a ~6x compile-time multiplier per nesting, and `async+sync` compiles each body twice. The
+   four nested blocks were most of this namespace's ~2 s load."
+  [frontend-store key opts]
+  (go (try
+        (<?- (-dissoc frontend-store key opts))
+        (catch #?(:clj Exception :cljs js/Error) e
+          (log/warn :konserve/tiered-frontend-invalidation-failed {:key key :error e})))))
+
+(defn ^:private invalidate-frontend-keys!
+  "`invalidate-frontend!` for several keys, in order. Returns the `go` channel, discarded."
+  [frontend-store keys opts]
+  (go (try
+        (doseq [k keys]
+          (<?- (-dissoc frontend-store k opts)))
+        (catch #?(:clj Exception :cljs js/Error) e
+          (log/warn :konserve/tiered-frontend-invalidation-failed {:kvs-keys keys :error e})))))
+
 (defn- complete-read-through
   "Populate one frontend read and run its write hook.
 
@@ -559,10 +583,7 @@
                    :write-around
                    ;; Write only to backend, invalidate frontend
                    (let [result (<?- (-update-in backend-store key-vec meta-up-fn up-fn opts))]
-                     (go (try
-                           (<?- (-dissoc frontend-store (first key-vec) (frontend-opts opts)))
-                           (catch #?(:clj Exception :cljs js/Error) e
-                             (log/warn :konserve/tiered-frontend-invalidation-failed {:key (first key-vec) :error e}))))
+                     (invalidate-frontend! frontend-store (first key-vec) (frontend-opts opts))
                      result)
 
                    :frontend-only
@@ -612,10 +633,7 @@
 
                    :write-around
                    (let [result (<?- (-assoc-in backend-store key-vec meta-up-fn val opts))]
-                     (go (try
-                           (<?- (-dissoc frontend-store (first key-vec) (frontend-opts opts)))
-                           (catch #?(:clj Exception :cljs js/Error) e
-                             (log/warn :konserve/tiered-frontend-invalidation-failed {:key (first key-vec) :error e}))))
+                     (invalidate-frontend! frontend-store (first key-vec) (frontend-opts opts))
                      result)
 
                    :frontend-only
@@ -681,10 +699,7 @@
 
                      :write-around
                      (let [result (<?- (-bassoc backend-store key meta-up-fn val opts))]
-                       (go (try
-                             (<?- (-dissoc frontend-store key opts))
-                             (catch #?(:clj Exception :cljs js/Error) e
-                               (log/warn :konserve/tiered-frontend-invalidation-failed {:key key :error e}))))
+                       (invalidate-frontend! frontend-store key opts)
                        result)
 
                      :frontend-only
@@ -755,11 +770,7 @@
                    :write-around
                    (let [result (<?- (-multi-assoc backend-store kvs meta-up-fn opts))]
                      ;; Invalidate all affected keys from frontend
-                     (go (try
-                           (doseq [k (kv-keys kvs)]
-                             (<?- (-dissoc frontend-store k opts)))
-                           (catch #?(:clj Exception :cljs js/Error) e
-                             (log/warn :konserve/tiered-frontend-invalidation-failed {:kvs-keys (kv-keys kvs) :error e}))))
+                     (invalidate-frontend-keys! frontend-store (kv-keys kvs) opts)
                      result)
 
                    :frontend-only

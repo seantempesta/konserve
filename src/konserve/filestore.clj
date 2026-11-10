@@ -2,6 +2,7 @@
   (:require
    [clojure.core.async :refer [go <! <!! chan close! put! timeout]]
    [clojure.java.io :as io]
+   [konserve.directory-sync :as directory-sync]
    [clojure.string :refer [includes? ends-with?]]
    [konserve.compressor :refer [null-compressor decompressing-stream]]
    [konserve.encryptor :refer [null-encryptor]]
@@ -81,31 +82,41 @@
   (merge *default-sync-translation*
          '{AsynchronousFileChannel FileChannel}))
 
+(defn- windows? []
+  (.startsWith (System/getProperty "os.name" "") "Windows"))
+
+(defn- open-directory-channel [filesystem base]
+  (FileChannel/open (get-path filesystem base) (into-array OpenOption [])))
+
+(defn- force-directory-channel! [^FileChannel channel]
+  (.force channel true))
+
 (defn- sync-base
-  "Helper Function to synchronize the base of the filestore.
-   Note: Jimfs doesn't support directory sync via FileChannel, so we skip it."
+  "Synchronize directory entries; skipping an unsupported barrier requires
+   explicit unsafe consent. Jimfs has no directory-sync implementation."
   ([base] (sync-base nil base))
-  ([filesystem base]
+  ([filesystem base] (sync-base filesystem base false))
+  ([filesystem base allow-unsafe?]
+   (when (and filesystem (not allow-unsafe?))
+     (throw (ex-info "Strict directory sync requires the default filesystem"
+                     {:type :konserve/unsupported-directory-sync})))
    ;; Only sync directories on the default filesystem (Jimfs doesn't support this).
    ;;
-   ;; Tolerant of a directory that cannot be opened. fsync-ing a DIRECTORY is a
-   ;; POSIX durability step for a just-renamed entry; Windows has no such
-   ;; operation, and `FileChannel/open` on a directory there throws
-   ;; AccessDeniedException whose whole message is the path. NTFS journals its
-   ;; metadata, so skipping the sync loses nothing that was available. Before
-   ;; this, `delete-store` on Windows failed with a bare
-   ;; "target\\native-image-tests" — the PARENT path, since the parent is what
-   ;; gets synced after an entry is removed — which was diagnosable only by
-   ;; reading the exception class datahike's CLI did not print.
-   ;; Only the OPEN is tolerated, and only its Windows shape. A `force` that
+   ;; Windows compatibility requires an explicit unsafe opt-in. Skipping this
+   ;; operation is not equivalent to completing a directory durability barrier.
+   ;; POSIX directory-open failures always propagate. A `force` that
    ;; fails on a directory that did open (EIO on POSIX) is the durability loss
    ;; this sync exists to surface, and propagates; `with-open` closes the
    ;; channel either way.
    (when-not filesystem
-     (when-let [fc (try (FileChannel/open (get-path filesystem base) (into-array OpenOption []))
-                        (catch java.nio.file.AccessDeniedException _ nil))]
-       (with-open [^FileChannel fc fc]
-         (.force fc true))))))
+     (if (and (windows?) (not allow-unsafe?))
+       (directory-sync/sync-directory! (get-path filesystem base))
+       (when-let [fc (try (open-directory-channel filesystem base)
+                          (catch java.nio.file.AccessDeniedException cause
+                            (when (or (not allow-unsafe?) (not (windows?)))
+                              (throw cause))))]
+         (with-open [^FileChannel fc fc]
+           (force-directory-channel! fc)))))))
 
 (defn- check-and-create-backing-store
   "Helper Function to Check if Base is not writable"
@@ -339,7 +350,8 @@
   (-sync-store [_this env]
     (async+sync (:sync? env) *default-sync-translation*
                 (go-try-
-                 (sync-base filesystem base))))
+                 (sync-base filesystem base
+                            (true? (get-in env [:config :allow-unsafe-directory-sync?]))))))
 
   PDataSyncBackingStore
   ;; Only the local filesystem on macOS: there `force` is F_FULLFSYNC and
@@ -393,12 +405,13 @@
 
 (defn- compressed-binary?
   "True when the binary's metadata says its payload went through `compressor`
-  (`konserve.impl.defaults/binary-write`). Only an unencrypted payload is."
+  (`konserve.impl.defaults/binary-write`). Only an unencrypted payload is, so
+  its metadata bytes are the serializer's through the compressor alone."
   [channel serializer compressor encryptor meta-size header-size]
   (and (not= compressor null-compressor)
        (= encryptor null-encryptor)
        (with-open [in (ByteArrayInputStream. (read-bytes-at! channel header-size meta-size))]
-         (:compressed? (kp/-deserialize (compressor ((encryptor nil) serializer))
+         (:compressed? (kp/-deserialize (compressor serializer)
                                         (atom {}) in)))))
 
 (defn- compressed-range
@@ -709,6 +722,11 @@
                                              :encryptor  encryptor
                                              :store-key  store-key
                                              :buffer-size buffer-size
+                                             ;; The store's config and mode travel
+                                             ;; with the env: `update-blob` picks
+                                             ;; its arm and its metrics labels there.
+                                             :config     (:config env)
+                                             :sync?      sync?
                                              :base base
                                              :key-vec [nkey]
                                              :up-fn-meta (fn [_] meta)}
@@ -736,7 +754,11 @@
                  (finally
                    (when binary?
                      (Files/delete data-path))
-                   (.close ^AsynchronousFileChannel c-data-file))))))
+                   ;; A FileChannel on the synchronous path, an
+                   ;; AsynchronousFileChannel otherwise: both are Channels.
+                   ;; The cast to the async one made every synchronous v1
+                   ;; migration throw ClassCastException at its close.
+                   (.close ^java.nio.channels.Channel c-data-file))))))
 
 (defn- migrate-file-v2
   "Migration Function For Konserve Version, who has Meta and Data Bases.
@@ -781,6 +803,8 @@
                                             :compressor compressor
                                             :encryptor  encryptor
                                             :buffer-size buffer-size
+                                            :config     (:config env)
+                                            :sync?      sync?
                                             :base base
                                             :store-key  store-key
                                             :key-vec [key]
@@ -881,6 +905,14 @@
   The :filesystem option allows using a custom java.nio.file.FileSystem (e.g., Jimfs for testing).
   When provided, all path operations will use that filesystem instead of the default.
 
+  Synced writes fail on directory open/force errors on every OS by default.
+  :config :allow-unsafe-directory-sync? true explicitly permits skipping directory
+  sync on custom filesystems or Windows directory-open AccessDeniedException.
+  This unsafe compatibility mode can lose acknowledged writes on system failure.
+  This qualifies directory syncing of entries, not hardware power-loss behavior
+  or durability of externally created parent directories. delete-store is an
+  independent best-effort administrative operation, not a strict deletion receipt.
+
   Compression and encryption are set UNDER :config, as a type keyword:
 
       (connect-fs-store path :config {:compressor {:type :lz4}})
@@ -936,6 +968,17 @@
                                             %))
                          (update :buffer-size #(or % (* 1024 1024)))
                          (update :opts #(or % {:sync? false})))
+        allow-unsafe? (get-in store-config [:config :allow-unsafe-directory-sync?] false)
+        _ (when-not (and (boolean? allow-unsafe?)
+                         (not (contains? (:config store-config) :strict-directory-sync?))
+                         (or (nil? filesystem) allow-unsafe?
+                             (false? (get-in store-config [:config :sync-blob?]))))
+            (throw (ex-info "Invalid directory-sync configuration"
+                            {:type :konserve/invalid-directory-sync-config})))
+        _ (when allow-unsafe?
+            (log/warn :konserve/unsafe-directory-sync
+                      {:base path
+                       :msg "Directory sync may be skipped; acknowledged writes may be lost on system failure."}))
         detect-old-blob (when detect-old-file-schema?
                           (atom (detect-old-file-schema filesystem path)))
         _                  (when detect-old-file-schema?

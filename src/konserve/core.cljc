@@ -2,10 +2,12 @@
   (:refer-clojure :exclude [get get-in update update-in assoc assoc-in exists? dissoc keys])
   (:require [clojure.core.async :refer [chan put! poll!]]
             [hasch.core :as hasch]
+            [konserve.encryptor :as encryptor]
             [konserve.protocols :as protocols :refer [PConditionalWrite -conditional-write-domain -revision
                                                       -exists? -get-meta -get-in -assoc-in
                                                       -update-in -dissoc -bget -bassoc
                                                       -bget-range
+                                                      -encrypt -decrypt
                                                       -keys -multi-get -multi-assoc -multi-dissoc
                                                       -assoc-serializers -get-write-hooks -lock-free?]]
             [konserve.utils :refer [meta-update multi-key-capable? kv-keys invoke-write-hooks! #?(:clj async+sync) *default-sync-translation*]
@@ -14,8 +16,10 @@
             [konserve.impl.defaults :as defaults]
             [konserve.store :as store]
             [superv.async :refer [go-try- <?-]]
+            [konserve.metrics]
             [replikativ.logging :as log])
-  #?(:cljs (:require-macros [konserve.core :refer [go-locked locked maybe-go-locked maybe-locked]])))
+  #?(:cljs (:require-macros [konserve.core :refer [go-locked locked maybe-go-locked maybe-locked]]
+                            [konserve.metrics])))
 
 ;; ACID
 
@@ -187,7 +191,9 @@
          k# ~key
          l# (get-lock s# k#)]
      (try
-       (wait l#)
+       (let [t0# (konserve.metrics/start)]
+         (wait l#)
+         (konserve.metrics/finish! s# :lock :lock t0#))
        (log/trace :konserve/acquired-spin-lock {:key k#})
        ~@code
        (finally
@@ -201,7 +207,11 @@
           k# ~key
           l# (get-lock s# k#)]
       (try
-        (<?- l#)
+        ;; Closure-free on purpose: this macro is inlined wherever a store is
+        ;; locked, and a go block per lock would blow up a method's size.
+        (let [t0# (konserve.metrics/start)]
+          (<?- l#)
+          (konserve.metrics/finish! s# :lock :lock t0#))
         (log/trace :konserve/acquired-go-lock {:key k#})
         ~@code
         (finally
@@ -233,9 +243,10 @@
    (log/trace :konserve/exists? {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (maybe-go-locked
-                store key
-                (<?- (-exists? store key opts))))))
+               (konserve.metrics/measured-go store :exists? :api
+                                             (maybe-go-locked
+                                              store key
+                                              (<?- (-exists? store key opts)))))))
 
 (defn get-in
   "Returns the value stored described by key. Returns nil if the key
@@ -256,9 +267,10 @@
    (log/trace :konserve/get-in {:key-vec key-vec})
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (maybe-go-locked
-                store (first key-vec)
-                (<?- (-get-in store key-vec not-found opts))))))
+               (konserve.metrics/measured-go store :get-in :api
+                                             (maybe-go-locked
+                                              store (first key-vec)
+                                              (<?- (-get-in store key-vec not-found opts)))))))
 
 (defn get
   "Returns the value stored described by key. Returns nil if the key
@@ -289,12 +301,13 @@
    (log/trace :konserve/get-meta {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (maybe-go-locked
-                store key
-                (let [a (<?- (-get-meta store key opts))]
-                  (if (some? a)
-                    a
-                    not-found))))))
+               (konserve.metrics/measured-go store :get-meta :api
+                                             (maybe-go-locked
+                                              store key
+                                              (let [a (<?- (-get-meta store key opts))]
+                                                (if (some? a)
+                                                  a
+                                                  not-found)))))))
 
 (def absent
   "The `:expected-revision` that means THE KEY MUST NOT EXIST — the create half of
@@ -368,7 +381,9 @@
    (when-not (conditional-write? store)
      (throw (ex-info "This store has no revisions to read: it cannot make a write conditional on one."
                      {:type :konserve/conditional-write-unsupported :store (type store)})))
-   (-revision store key opts)))
+   (if (:sync? opts)
+     (konserve.metrics/measured store :revision :api (-revision store key opts))
+     (konserve.metrics/measured-go store :revision :api (-revision store key opts)))))
 
 (defn check-conditional-supported!
   "Throw unless `store` can honour an `:expected-revision` in `opts`.
@@ -466,11 +481,12 @@
    (check-conditional-supported! store opts)
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (go-locked
-                store (first key-vec)
-                (let [base (partial meta-update (first key-vec) :edn)
-                      mfn  (if meta-up-fn (fn [old] (meta-up-fn (base old))) base)
-                      result (<?- (-update-in store key-vec mfn up-fn opts))
+               (konserve.metrics/measured-go store :update-in :api
+                                             (go-locked
+                                              store (first key-vec)
+                                              (let [base (partial meta-update (first key-vec) :edn)
+                                                    mfn  (if meta-up-fn (fn [old] (meta-up-fn (base old))) base)
+                                                    result (<?- (-update-in store key-vec mfn up-fn opts))
                       ;; `:with-revision?` makes the result `[[old new] revision]`
                       ;; rather than `[old new]`, so destructuring it as the plain
                       ;; shape put the REVISION TOKEN in the hook's `:value` — and
@@ -478,13 +494,13 @@
                       ;; would replicate the token as the key's data. The hook
                       ;; reports the value either way; the revision is the caller's
                       ;; business, not the replica's.
-                      [old-val new-val] (if (:with-revision? opts) (first result) result)]
-                  (invoke-write-hooks! store {:api-op :update-in
-                                              :key (first key-vec)
-                                              :key-vec key-vec
-                                              :old-value old-val
-                                              :value new-val})
-                  result)))))
+                                                    [old-val new-val] (if (:with-revision? opts) (first result) result)]
+                                                (invoke-write-hooks! store {:api-op :update-in
+                                                                            :key (first key-vec)
+                                                                            :key-vec key-vec
+                                                                            :old-value old-val
+                                                                            :value new-val})
+                                                result))))))
 
 #_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
 (defn update
@@ -527,16 +543,17 @@
    (check-conditional-supported! store opts)
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (go-locked
-                store (first key-vec)
-                (let [base   (partial meta-update (first key-vec) :edn)
-                      mfn    (if meta-up-fn (fn [old] (meta-up-fn (base old))) base)
-                      result (<?- (-assoc-in store key-vec mfn val opts))]
-                  (invoke-write-hooks! store {:api-op :assoc-in
-                                              :key (first key-vec)
-                                              :key-vec key-vec
-                                              :value val})
-                  result)))))
+               (konserve.metrics/measured-go store :assoc-in :api
+                                             (go-locked
+                                              store (first key-vec)
+                                              (let [base   (partial meta-update (first key-vec) :edn)
+                                                    mfn    (if meta-up-fn (fn [old] (meta-up-fn (base old))) base)
+                                                    result (<?- (-assoc-in store key-vec mfn val opts))]
+                                                (invoke-write-hooks! store {:api-op :assoc-in
+                                                                            :key (first key-vec)
+                                                                            :key-vec key-vec
+                                                                            :value val})
+                                                result))))))
 
 (defn assoc
   "Associates the key to the value. This is a simple top-level overwrite
@@ -567,15 +584,16 @@
    (check-conditional-supported! store opts)
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (maybe-go-locked
-                store key
-                (let [mfn    (if meta
-                               (fn [old] (clojure.core/merge meta (meta-update key :edn old)))
-                               (partial meta-update key :edn))
-                      result (<?- (-assoc-in store [key] mfn val opts))]
-                  (invoke-write-hooks! store (cond-> {:api-op :assoc :key key :value val}
-                                               meta (clojure.core/assoc :meta meta)))
-                  result)))))
+               (konserve.metrics/measured-go store :assoc :api
+                                             (maybe-go-locked
+                                              store key
+                                              (let [mfn    (if meta
+                                                             (fn [old] (clojure.core/merge meta (meta-update key :edn old)))
+                                                             (partial meta-update key :edn))
+                                                    result (<?- (-assoc-in store [key] mfn val opts))]
+                                                (invoke-write-hooks! store (cond-> {:api-op :assoc :key key :value val}
+                                                                             meta (clojure.core/assoc :meta meta)))
+                                                result))))))
 
 (defn multi-get
   "Atomically retrieves multiple values by keys.
@@ -619,21 +637,22 @@
                                                        :reason "Store doesn't implement PMultiKeyEDNValueStore protocol or multi-key support is disabled"}))))
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (go-try-
-                (try
-                  (<?- (-multi-get store keys opts))
-                  (catch #?(:clj Exception :cljs js/Error) e
+               (konserve.metrics/measured-go store :multi-get :api
+                                             (go-try-
+                                              (try
+                                                (<?- (-multi-get store keys opts))
+                                                (catch #?(:clj Exception :cljs js/Error) e
                     ;; Backend might throw an exception indicating it doesn't support multi-key operations
                     ;; even though the store implements the protocol
-                    #?(:clj
-                       (if (and (instance? clojure.lang.ExceptionInfo e)
-                                (= :not-supported (:type (ex-data e))))
-                         (throw (ex-info "Backing store does not support multi-key operations"
-                                         {:store-type (type store)
-                                          :cause e
-                                          :reason (:reason (ex-data e))}))
-                         (throw e))
-                       :cljs (throw e))))))))
+                                                  #?(:clj
+                                                     (if (and (instance? clojure.lang.ExceptionInfo e)
+                                                              (= :not-supported (:type (ex-data e))))
+                                                       (throw (ex-info "Backing store does not support multi-key operations"
+                                                                       {:store-type (type store)
+                                                                        :cause e
+                                                                        :reason (:reason (ex-data e))}))
+                                                       (throw e))
+                                                     :cljs (throw e)))))))))
 
 (defn uniform-meta
   "Build a per-key meta map applying the same `meta` to every key — a convenience
@@ -745,12 +764,13 @@
                                                        :reason "Store doesn't implement PMultiKeyEDNValueStore protocol or multi-key support is disabled"}))))
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (go-try-
-                (let [meta-all (:meta-all opts)
-                      _ (when (and meta meta-all)
-                          (throw (#?(:clj ex-info :cljs js/Error.)
-                                  "Pass either a per-key `meta` or `:meta-all`, not both"
-                                  {:type :konserve/ambiguous-meta})))
+               (konserve.metrics/measured-go store :multi-assoc :api
+                                             (go-try-
+                                              (let [meta-all (:meta-all opts)
+                                                    _ (when (and meta meta-all)
+                                                        (throw (#?(:clj ex-info :cljs js/Error.)
+                                                                "Pass either a per-key `meta` or `:meta-all`, not both"
+                                                                {:type :konserve/ambiguous-meta})))
                       ;; UNIFORM ANNOTATION NEEDS NO KEYS, and that is the whole
                       ;; point of `:meta-all`. `uniform-meta` existed to turn one
                       ;; annotation into a per-key map, which meant DERIVING THE
@@ -759,13 +779,13 @@
                       ;; `(uniform-meta (keys m) ..)` on `{[:a 1] v}` produced
                       ;; `{:a ..}` and the annotation was silently dropped.
                       ;; Naming the two intents removes the guess entirely.
-                      mfn    (cond
-                               meta-all
-                               (fn [key type old] (clojure.core/merge meta-all (meta-update key type old)))
-                               meta
+                                                    mfn    (cond
+                                                             meta-all
+                                                             (fn [key type old] (clojure.core/merge meta-all (meta-update key type old)))
+                                                             meta
                                ;; per-key meta map: `(get meta key)` (nil ⇒ just the built meta)
-                               (fn [key type old] (clojure.core/merge (clojure.core/get meta key) (meta-update key type old)))
-                               :else meta-update)
+                                                             (fn [key type old] (clojure.core/merge (clojure.core/get meta key) (meta-update key type old)))
+                                                             :else meta-update)
                       ;; A `meta` MAP THAT NAMES NO KEY OF THIS BATCH IS ALWAYS A
                       ;; MISTAKE, and it used to be a silent one: the write
                       ;; succeeded and the annotation vanished. `uniform-meta`
@@ -780,31 +800,31 @@
                       ;; is the documented mixed-batch case -- immutable nodes
                       ;; plus the mutable pointer that makes them reachable --
                       ;; so a single overlapping key is enough to be intentional.
-                      _ (when (seq meta)
-                          (let [ks (set (kv-keys kvs))]
-                            (when-not (some ks (clojure.core/keys meta))
-                              (throw (#?(:clj ex-info :cljs js/Error.)
-                                      (str "multi-assoc: none of `meta`'s keys appear in `kvs`, "
-                                           "so no value would receive it. If this came from "
-                                           "`uniform-meta`, pass the kv-map itself, name the keys, "
-                                           "or use {:meta-all m} in opts.")
-                                      {:type :konserve/meta-keys-disjoint
-                                       :meta-keys (vec (clojure.core/keys meta))
-                                       :kvs-keys (vec ks)})))))
-                      result (try
-                               (<?- (-multi-assoc store kvs mfn opts))
-                               (catch #?(:clj Exception :cljs js/Error) e
+                                                    _ (when (seq meta)
+                                                        (let [ks (set (kv-keys kvs))]
+                                                          (when-not (some ks (clojure.core/keys meta))
+                                                            (throw (#?(:clj ex-info :cljs js/Error.)
+                                                                    (str "multi-assoc: none of `meta`'s keys appear in `kvs`, "
+                                                                         "so no value would receive it. If this came from "
+                                                                         "`uniform-meta`, pass the kv-map itself, name the keys, "
+                                                                         "or use {:meta-all m} in opts.")
+                                                                    {:type :konserve/meta-keys-disjoint
+                                                                     :meta-keys (vec (clojure.core/keys meta))
+                                                                     :kvs-keys (vec ks)})))))
+                                                    result (try
+                                                             (<?- (-multi-assoc store kvs mfn opts))
+                                                             (catch #?(:clj Exception :cljs js/Error) e
                                  ;; Backend might throw an exception indicating it doesn't support multi-key operations
                                  ;; even though the store implements the protocol
-                                 #?(:clj
-                                    (if (and (instance? clojure.lang.ExceptionInfo e)
-                                             (= :not-supported (:type (ex-data e))))
-                                      (throw (ex-info "Backing store does not support multi-key operations"
-                                                      {:store-type (type store)
-                                                       :cause e
-                                                       :reason (:reason (ex-data e))}))
-                                      (throw e))
-                                    :cljs (throw e))))]
+                                                               #?(:clj
+                                                                  (if (and (instance? clojure.lang.ExceptionInfo e)
+                                                                           (= :not-supported (:type (ex-data e))))
+                                                                    (throw (ex-info "Backing store does not support multi-key operations"
+                                                                                    {:store-type (type store)
+                                                                                     :cause e
+                                                                                     :reason (:reason (ex-data e))}))
+                                                                    (throw e))
+                                                                  :cljs (throw e))))]
                   ;; HOOKS ALWAYS SEE A PER-KEY MAP, whichever way the caller
                   ;; expressed it. `:meta-all` is expanded here and never escapes
                   ;; this namespace, so a consumer like konserve-sync keeps its
@@ -814,12 +834,12 @@
                   ;;
                   ;; Expanded ONLY when a hook is registered, so the write path
                   ;; still avoids building an N-entry map to say one thing.
-                  (invoke-write-hooks! store (cond-> {:api-op :multi-assoc :kvs kvs}
-                                               meta     (clojure.core/assoc :meta meta)
-                                               meta-all (clojure.core/assoc
-                                                         :meta (zipmap (kv-keys kvs)
-                                                                       (clojure.core/repeat meta-all)))))
-                  result)))))
+                                                (invoke-write-hooks! store (cond-> {:api-op :multi-assoc :kvs kvs}
+                                                                             meta     (clojure.core/assoc :meta meta)
+                                                                             meta-all (clojure.core/assoc
+                                                                                       :meta (zipmap (kv-keys kvs)
+                                                                                                     (clojure.core/repeat meta-all)))))
+                                                result))))))
 
 (defn dissoc
   "Removes an entry from the store. "
@@ -830,13 +850,14 @@
    (refuse-conditional-unsupported! "dissoc" opts)
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (maybe-go-locked
-                store key
-                (let [result (<?- (-dissoc store key opts))]
-                  (when result
-                    (invoke-write-hooks! store {:api-op :dissoc
-                                                :key key}))
-                  result)))))
+               (konserve.metrics/measured-go store :dissoc :api
+                                             (maybe-go-locked
+                                              store key
+                                              (let [result (<?- (-dissoc store key opts))]
+                                                (when result
+                                                  (invoke-write-hooks! store {:api-op :dissoc
+                                                                              :key key}))
+                                                result))))))
 
 (defn multi-dissoc
   "Atomically dissociates multiple keys with flat keys.
@@ -868,21 +889,22 @@
                                                        :reason "Store doesn't implement PMultiKeyEDNValueStore protocol or multi-key support is disabled"}))))
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (go-try-
-                (try
-                  (<?- (-multi-dissoc store keys opts))
-                  (catch #?(:clj Exception :cljs js/Error) e
+               (konserve.metrics/measured-go store :multi-dissoc :api
+                                             (go-try-
+                                              (try
+                                                (<?- (-multi-dissoc store keys opts))
+                                                (catch #?(:clj Exception :cljs js/Error) e
                     ;; Backend might throw an exception indicating it doesn't support multi-key operations
                     ;; even though the store implements the protocol
-                    #?(:clj
-                       (if (and (instance? clojure.lang.ExceptionInfo e)
-                                (= :not-supported (:type (ex-data e))))
-                         (throw (ex-info "Backing store does not support multi-key operations"
-                                         {:store-type (type store)
-                                          :cause e
-                                          :reason (:reason (ex-data e))}))
-                         (throw e))
-                       :cljs (throw e))))))))
+                                                  #?(:clj
+                                                     (if (and (instance? clojure.lang.ExceptionInfo e)
+                                                              (= :not-supported (:type (ex-data e))))
+                                                       (throw (ex-info "Backing store does not support multi-key operations"
+                                                                       {:store-type (type store)
+                                                                        :cause e
+                                                                        :reason (:reason (ex-data e))}))
+                                                       (throw e))
+                                                     :cljs (throw e)))))))))
 
 (defn- append-steps
   "The append's read and three writes: the new element, the old last element's :next, the
@@ -918,12 +940,16 @@
    (let [backing (:backing store)]
      (if (satisfies? storage-layout/PTransactBackingStore backing)
        (let [run #(storage-layout/-transact backing (fn [] (append-steps store key elem (clojure.core/assoc opts :sync? true))))]
-         (if (:sync? opts) (run) (go-try- (run))))
+         (async+sync (:sync? opts)
+                     *default-sync-translation*
+                     (konserve.metrics/measured-go store :append :api
+                                                   (go-try- (run)))))
        (async+sync (:sync? opts)
                    *default-sync-translation*
-                   (go-locked
-                    store key
-                    (<?- (append-steps store key elem opts))))))))
+                   (konserve.metrics/measured-go store :append :api
+                                                 (go-locked
+                                                  store key
+                                                  (<?- (append-steps store key elem opts)))))))))
 
 (defn log
   "Loads the whole append log stored at key."
@@ -933,18 +959,19 @@
    (log/trace :konserve/log {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (go-try-
-                (let [head (<?- (get store key nil opts))
-                      [append-log? _last-id first-id] head]
-                  (when (and head (not= append-log? :append-log))
-                    (throw (ex-info "This is not an append-log." {:key key})))
-                  (when first-id
-                    (loop [{:keys [next elem]} (<?- (get store first-id nil opts))
-                           hist []]
-                      (if next
-                        (recur (<?- (get store next nil opts))
-                               (conj hist elem))
-                        (conj hist elem)))))))))
+               (konserve.metrics/measured-go store :log :api
+                                             (go-try-
+                                              (let [head (<?- (get store key nil opts))
+                                                    [append-log? _last-id first-id] head]
+                                                (when (and head (not= append-log? :append-log))
+                                                  (throw (ex-info "This is not an append-log." {:key key})))
+                                                (when first-id
+                                                  (loop [{:keys [next elem]} (<?- (get store first-id nil opts))
+                                                         hist []]
+                                                    (if next
+                                                      (recur (<?- (get store next nil opts))
+                                                             (conj hist elem))
+                                                      (conj hist elem))))))))))
 
 (defn reduce-log
   "Loads the append log and applies reduce-fn over it."
@@ -954,19 +981,65 @@
    (log/trace :konserve/reduce-log {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (go-try-
-                (let [head (<?- (get store key nil opts))
-                      [append-log? last-id first-id] head]
-                  (when (and head (not= append-log? :append-log))
-                    (throw (ex-info "This is not an append-log." {:key key})))
-                  (if first-id
-                    (loop [id first-id
-                           acc acc]
-                      (let [{:keys [next elem]} (<?- (get store id nil opts))]
-                        (if (and next (not= id last-id))
-                          (recur next (reduce-fn acc elem))
-                          (reduce-fn acc elem))))
-                    acc))))))
+               (konserve.metrics/measured-go store :reduce-log :api
+                                             (go-try-
+                                              (let [head (<?- (get store key nil opts))
+                                                    [append-log? last-id first-id] head]
+                                                (when (and head (not= append-log? :append-log))
+                                                  (throw (ex-info "This is not an append-log." {:key key})))
+                                                (if first-id
+                                                  (loop [id first-id
+                                                         acc acc]
+                                                    (let [{:keys [next elem]} (<?- (get store id nil opts))]
+                                                      (if (and next (not= id last-id))
+                                                        (recur next (reduce-fn acc elem))
+                                                        (reduce-fn acc elem))))
+                                                  acc)))))))
+
+(defn encrypted?
+  "True when this store has a non-null value encryptor configured."
+  [store]
+  (let [{:keys [encryptor config]} store]
+    (boolean (when encryptor
+               (encryptor/encrypting? (encryptor (:encryptor config)))))))
+
+(defn- store-cipher [store]
+  (when-not (encrypted? store)
+    (throw (ex-info "This store has no encryptor configured."
+                    {:type :konserve/no-encryptor})))
+  ((:encryptor store) (:encryptor (:config store))))
+
+(defn seal
+  "Encrypt bytes under the store's configured key, bound to the Konserve key.
+
+  Returns a channel unless `{:sync? true}` is supplied."
+  ([store key bytes]
+   (seal store key bytes {:sync? false}))
+  ([store key bytes opts]
+   (async+sync
+    (:sync? opts) *default-sync-translation*
+    (go-try-
+     (<?- (-encrypt (store-cipher store)
+                    bytes
+                    (encryptor/associated-data (:version store)
+                                               (defaults/key->store-key key)
+                                               :binary)
+                    opts))))))
+
+(defn unseal
+  "Decrypt bytes produced by `seal` for the same store and Konserve key."
+  ([store key bytes]
+   (unseal store key bytes {:sync? false}))
+  ([store key bytes opts]
+   (async+sync
+    (:sync? opts) *default-sync-translation*
+    (go-try-
+     (<?- (-decrypt (store-cipher store)
+                    bytes
+                    (encryptor/associated-data (:version store)
+                                               (defaults/key->store-key key)
+                                               :binary)
+                    opts))))))
 
 (defn bget
   "Calls locked-cb with a platform specific binary representation inside the lock.
@@ -1000,16 +1073,21 @@
   File stores accept `:streaming? true` to expose a bounded view over the stored
   payload instead of first materializing it. In that mode the callback must fully
   consume the stream before it (or its returned channel) completes; the view is
-  valid only while Konserve owns the locked backing object."
+  valid only while Konserve owns the locked backing object.
+
+  Binary payload bytes are not encrypted automatically. An encrypted store
+  therefore requires `{:raw? true}`; use `seal` and `unseal` when the bytes
+  should use the store's key."
   ([store key locked-cb]
    (bget store key locked-cb {:sync? false}))
   ([store key locked-cb opts]
    (log/trace :konserve/bget {:key key})
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (maybe-go-locked
-                store key
-                (<?- (-bget store key locked-cb opts))))))
+               (konserve.metrics/measured-go store :bget :api
+                                             (maybe-go-locked
+                                              store key
+                                              (<?- (-bget store key locked-cb opts)))))))
 
 (defn bget-range
   "Returns at most `length` binary bytes beginning at `offset`.
@@ -1036,7 +1114,11 @@
    `{:compress? true}` in `opts` passes the bytes through the store's compressor
    when that makes them smaller (JVM; not a Reader). The value is then read into
    memory whole to compress it, and its metadata records `:compressed? true` and
-   the uncompressed `:size`; `bget` and `bget-range` read it back uncompressed."
+   the uncompressed `:size`; `bget` and `bget-range` read it back uncompressed.
+
+  Binary payload bytes are not encrypted automatically. An encrypted store
+  therefore requires `{:raw? true}`; use `seal` and `unseal` when the bytes
+  should use the store's key."
   ([store key val]
    (bassoc store key val nil {:sync? false}))
   ([store key val opts]
@@ -1046,17 +1128,18 @@
    (refuse-conditional-unsupported! "bassoc" opts)
    (async+sync (:sync? opts)
                *default-sync-translation*
-               (maybe-go-locked
-                store key
-                (let [mfn    (if meta
-                               (fn [old] (clojure.core/merge meta (meta-update key :binary old)))
-                               (partial meta-update key :binary))
-                      result (<?- (-bassoc store key mfn val opts))]
-                  (invoke-write-hooks! store (cond-> {:api-op :bassoc
-                                                      :key key
-                                                      :value val}
-                                               meta (clojure.core/assoc :meta meta)))
-                  result)))))
+               (konserve.metrics/measured-go store :bassoc :api
+                                             (maybe-go-locked
+                                              store key
+                                              (let [mfn    (if meta
+                                                             (fn [old] (clojure.core/merge meta (meta-update key :binary old)))
+                                                             (partial meta-update key :binary))
+                                                    result (<?- (-bassoc store key mfn val opts))]
+                                                (invoke-write-hooks! store (cond-> {:api-op :bassoc
+                                                                                    :key key
+                                                                                    :value val}
+                                                                             meta (clojure.core/assoc :meta meta)))
+                                                result))))))
 
 (defn keys
   "Return a channel that will yield all top-level keys currently in the store."
@@ -1064,7 +1147,9 @@
    (keys store {:sync? false}))
   ([store opts]
    (log/trace :konserve/keys "fetching keys")
-   (-keys store opts)))
+   (if (:sync? opts)
+     (konserve.metrics/measured store :keys :api (-keys store opts))
+     (konserve.metrics/measured-go store :keys :api (-keys store opts)))))
 
 (defn assoc-serializers
   "Assoc the given serializers onto the store, taking effect immediately."

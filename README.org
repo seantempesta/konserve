@@ -35,6 +35,13 @@ consistent (in fact ACID), but further consistency across keys is, depending on 
 
 ** Quick Start
 
+Windows JVM file stores require *JDK 22+* and
+=--enable-native-access=ALL-UNNAMED= for directory persistence through the
+Windows API. No bundled JNI library is required. This Windows-specific minimum
+does not raise the Unix JVM requirement. GraalVM native Windows validation targets
+version 25 on x64; older native toolchains are not qualified. See
+[[file:doc/strict-directory-sync.md][directory persistence and qualification limits]].
+
 Add to your dependencies: [[https://clojars.org/org.replikativ/konserve][https://img.shields.io/clojars/v/org.replikativ/konserve.svg]]
 
 #+BEGIN_SRC clojure
@@ -325,6 +332,7 @@ After requiring a backend module, it automatically registers with the multimetho
 *** Available External Backends
 
 - =:s3= - AWS S3 ([[https://github.com/replikativ/konserve-s3][konserve-s3]])
+- =:azure-blob= - Azure Blob Storage ([[https://github.com/replikativ/konserve-azure-blob][konserve-azure-blob]])
 - =:dynamodb= - AWS DynamoDB ([[https://github.com/replikativ/konserve-dynamodb][konserve-dynamodb]])
 - =:redis= - Redis ([[https://github.com/replikativ/konserve-redis][konserve-redis]])
 - =:lmdb= - LMDB ([[https://github.com/replikativ/konserve-lmdb][konserve-lmdb]])
@@ -449,6 +457,53 @@ like store synchronization, change logging, or triggering side effects.
 Hooks are invoked at the API layer (in =konserve.core=), so they work consistently
 across all store backends. Stores must implement the =PWriteHookStore= protocol.
 
+*** Metrics
+
+Every store operation reports to a process-wide registry of named sinks, with
+no store wrapped and no store changing identity: the labels come from the
+config the store was connected with. Register a sink — any =(fn [event])= —
+and every backend on =DefaultStore= (file, S3, GCS, JDBC, …) reports at three
+levels:
+
+#+BEGIN_SRC clojure
+  (require '[konserve.metrics :as metrics])
+
+  (metrics/add-sink! ::log (fn [event] (println event)))
+  ;; {:backend :file :store-id #uuid "…" :op :lock      :level :lock :nanos 2100}
+  ;; {:backend :file :store-id #uuid "…" :op :write-edn :level :io   :bytes 4096}
+  ;; {:backend :file :store-id #uuid "…" :op :write-edn :level :io   :nanos 640000}
+  ;; {:backend :file :store-id #uuid "…" :op :assoc-in  :level :api  :nanos 812345}
+
+  (metrics/remove-sink! ::log)
+#+END_SRC
+
+- =:api= is what a caller waits for — lock wait, serialization and I/O
+  together — one event per public function (=get-in=, =assoc-in=, =bget=,
+  =multi-assoc=, =keys=, …), with =:error= (the exception's class name) when
+  it threw. A call rejected before it reaches the store produces none; a
+  function that delegates (=get= to =get-in=) reports as what it delegates to.
+- =:io= is the backend alone, below the lock, per blob operation
+  (=:read-edn=, =:write-edn=, =:write-binary=, =:delete=, =:multi-read=, …)
+  from the first byte of a backup copy or header read to the end of the move,
+  with the read of the old value before a write as =:read-old=; plus a
+  =:bytes= event for what a write serialized (metadata and value; not the
+  header, not a streamed binary).
+- =:lock= is the wait for the in-process key lock, the number that explains
+  contention between writers; a lock-free store has no wait and no event.
+
+Two rules for a sink, because it runs on the operation's own thread: it must
+be thread-safe (events from concurrent operations interleave; each is
+self-contained, so aggregation needs no ordering) and non-blocking — count
+into atomics, or hand events to a buffered channel drained elsewhere. A sink
+that throws is logged and skipped; it never fails the operation it observed.
+
+The =:backend= and =:store-id= labels are the =:backend= and =:id= of the
+config passed to =connect-store= / =create-store=; a store opened through a
+backend's own connect function has no id and is labelled by its backing's
+type. With no sink registered the cost is one deref per measurement site and
+nothing else. A sink aggregates as it likes — per =[backend store-id op]=
+histograms for Prometheus, or an atom in a test.
+
 *** Garbage Collection
 
 Konserve has a garbage collector that can be called manually when the store gets
@@ -474,9 +529,12 @@ used by all current backends except lmdb and memory.
   (def config {:backend :file
                :id #uuid "550e8400-e29b-41d4-a716-44665544000c"
                :path "/tmp/secure-store"
-               :config {:encryptor {:type :aes
-                                   :key "s3cr3t"}
-                       :compressor {:type :lz4}}})
+               :config
+               {:encoding
+                {:encryptor {:type :aes-gcm
+                             ;; 32 random bytes, shown as 64 hex characters
+                             :key (konserve.encryptor/generate-key)}
+                 :compressor {:type :lz4}}}})
 
   (def store (k/create-store config {:sync? true}))
 #+END_SRC
@@ -498,9 +556,27 @@ frame header carries **no content size**. A one-shot decompressor fails on
 these frames; use a streaming one. See =interop/read_konserve_blob.py=.
 
 *Encryption:*
-- AES/CBC/PKCS{5/7}Padding with 256 bit
-- Different salt for each written value
-- Same cold storage format for JVM and JS (cross-runtime compatible)
+- =:aes-gcm= — AES-256-GCM authenticated encryption. Each metadata/value
+  segment has a fresh salt and per-segment key; associated data binds it to
+  the layout version, store key, and segment. Tampering, truncation, and moving
+  ciphertext between keys or segments are therefore rejected. Encryptor byte 2.
+- =:aes= — legacy, unauthenticated AES-CBC. Encryptor byte 1. It remains
+  readable for existing stores but must not be selected for new ones.
+- For control-plane records that must never accept plaintext or legacy CBC,
+  set =:require-authenticated? true= inside the =:encryptor= map alongside
+  =:type :aes-gcm= and =:key=. This rejects weaker header-selected formats
+  before deserialization. The default still permits compatibility reads of
+  older records. Unknown encryptor types now fail instead of selecting none.
+  This policy does not prevent rollback of an older authentic record; keep an
+  independent revision floor where rollback resistance is required.
+- =:aes-gcm= uses the asynchronous API in ClojureScript because Web Crypto has
+  no synchronous cipher. Its bytes are interoperable between JVM and JS.
+
+Binary values remain streaming and are not automatically encrypted. On an
+encrypted store, =bassoc= and =bget= therefore require ={:raw? true}= so
+plaintext cannot be stored accidentally. Use =konserve.core/seal= and =unseal=
+to authenticate and encrypt a materialized binary value under the store's key
+before storing it as raw bytes.
 
 *** Serialization Formats
 
@@ -531,7 +607,7 @@ value:
   byte 0     storage layout version (1)
   byte 1     serializer id      (3 = BoringSerializer)
   byte 2     compressor id      (0 none, 1 lz4, 2 zstd)
-  byte 3     encryptor id       (0 none, 1 aes)
+  byte 3     encryptor id       (0 none, 1 legacy aes, 2 aes-gcm)
   bytes 4-7  metadata length, big-endian
   bytes 8-19 spare, zero
 #+END_SRC
