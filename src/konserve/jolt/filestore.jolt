@@ -30,7 +30,12 @@
   PBackingLock
   (-release [_ env] (sync-or-go env (p/unlock fd) nil)))
 
-(defn- input->bytes ^bytes [input]
+(defn input->bytes
+  "The bytes of a bassoc input, in every shape bassoc documents (bytes, a String,
+  a File, an InputStream): Jolt's backings take bassoc's input as given
+  (konserve.nio-helpers is not loaded on Jolt), so each one's -write-binary reads
+  it through this one function."
+  ^bytes [input]
   (cond
     (bytes? input) input
     (string? input) (.getBytes ^String input "UTF-8")

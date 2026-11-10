@@ -19,7 +19,7 @@
             [konserve.encryptor :refer [null-encryptor]]
             [konserve.jolt.lmdb-ffi :as l]
             [konserve.jolt.posix :as p]
-            [konserve.jolt.filestore :refer [default-encoding]]
+            [konserve.jolt.filestore :refer [default-encoding input->bytes]]
             [superv.async :refer [go-try- <?-]])
   (:import [java.io ByteArrayInputStream]))
 
@@ -38,12 +38,6 @@
 
 (defn- slice ^bytes [^bytes bs from n]
   (let [out (byte-array n)] (System/arraycopy bs from out 0 n) out))
-
-(defn- input->bytes ^bytes [input]
-  (cond (bytes? input) input
-        (string? input) (.getBytes ^String input "UTF-8")
-        (instance? java.io.InputStream input) (.readAllBytes ^java.io.InputStream input)
-        :else (throw (ex-info "Unsupported binary input." {:type (type input)}))))
 
 (defprotocol ^:private IFlush (-flush [this]))
 
