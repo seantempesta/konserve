@@ -19,6 +19,7 @@
             [konserve.encryptor :refer [null-encryptor]]
             [konserve.jolt.lmdb-ffi :as l]
             [konserve.jolt.posix :as p]
+            [konserve.jolt.filestore :refer [default-encoding]]
             [superv.async :refer [go-try- <?-]])
   (:import [java.io ByteArrayInputStream]))
 
@@ -188,8 +189,7 @@
   konserve.filestore/connect-fs-store plus :lmdb {:map-size :max-readers :flags}."
   [path & {:keys [config lmdb] :as params}]
   (let [db (acquire-env! path lmdb)
-        store-config (merge {:default-serializer :StringSerializer
-                             :compressor null-compressor
+        store-config (merge {:compressor null-compressor
                              :encryptor null-encryptor
                              :read-handlers (atom {})
                              :write-handlers (atom {})
@@ -197,6 +197,6 @@
                              :opts {:sync? false}
                              :config (merge {:sync-blob? false :in-place? true :no-backup? true
                                              :lock-blob? true}
-                                            config)}
+                                            (default-encoding config params))}
                             (dissoc params :config :lmdb))]
     (connect-default-store (->BackingLmdb db) store-config)))

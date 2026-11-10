@@ -150,20 +150,30 @@
   (-read-binary-range [_ store-key serializers offset length _env]
     (read-range base store-key serializers offset length)))
 
+(defn default-encoding
+  "`config` with a Jolt store's default serializer, :StringSerializer (Fressian
+  is JVM-only), at `:config :encoding :serializer`, where
+  `konserve.impl.defaults/normalize-store-config` reads it, unless the caller
+  named one there or by the older top-level `:default-serializer`. Naming the
+  default at the top level made every connect warn of a deprecated spelling."
+  [config params]
+  (cond-> (or config {})
+    (not (or (get-in config [:encoding :serializer]) (:default-serializer params)))
+    (assoc-in [:encoding :serializer] :StringSerializer)))
+
 (defn connect-fs-store
   "A konserve store in directory `path`, layout-compatible with
   konserve.filestore/connect-fs-store. Same options; the default serializer is
   :StringSerializer here because Fressian is JVM-only."
   [path & {:keys [config] :as params}]
-  (let [store-config (merge {:default-serializer :StringSerializer
-                             :compressor null-compressor
+  (let [store-config (merge {:compressor null-compressor
                              :encryptor null-encryptor
                              :read-handlers (atom {})
                              :write-handlers (atom {})
                              :buffer-size (* 1024 1024)
                              :opts {:sync? false}
                              :config (merge {:sync-blob? true :in-place? false :lock-blob? true}
-                                            config)}
+                                            (default-encoding config params))}
                             (dissoc params :config))]
     (connect-default-store (->BackingPosixFilestore path) store-config)))
 
