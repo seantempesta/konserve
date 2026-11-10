@@ -56,3 +56,15 @@
       (is (= [] @seen))
       (lmdb! :default-serializer :StringSerializer)
       (is (= [:default-serializer] @seen)))))
+
+(deftest a-directory-to-delete-has-its-envs-closed
+  ;; close-envs-under! closes the envs at and under a directory and no other
+  (let [base (str (System/getProperty "java.io.tmpdir") "/konserve-under-test-" (random-uuid))
+        a (str base "/a") b (str base "/b/c") other (str base "-other")]
+    (try
+      (doseq [path [a b other]] (lmdb/connect-lmdb-store path :opts {:sync? true}))
+      (is (= #{a b} (set (lmdb/close-envs-under! (str base "/")))))
+      (is (= [] (lmdb/close-envs-under! base)) "closed already")
+      (is (= [other] (lmdb/close-envs-under! other)))
+      (finally (doseq [path [a b other]] (lmdb/close-env! path))
+               (clojure.java.shell/sh "rm" "-rf" base other)))))

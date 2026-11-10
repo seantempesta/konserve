@@ -107,6 +107,19 @@
     (swap! holders dissoc path)
     (l/close-env db)))
 
+(defn close-envs-under!
+  "Close every env this process has open at directory dir or under it, as for a directory
+  about to be deleted: an env's last close removes its lock resources, which a process that
+  exits with the env still open leaves behind (with LMDB's SysV semaphores, a set that
+  outlives the env's files). A store still using one reads :lmdb-env-closed after. Paths are
+  compared as canonical paths. Answers the paths closed."
+  [dir]
+  (let [canon #(str (.getCanonicalPath (java.io.File. ^String %)) "/")
+        d (canon dir)]
+    (locking envs
+      (into [] (keep (fn [path] (when (.startsWith ^String (canon path) d) (close-env! path) path)))
+            (keys @envs)))))
+
 (defn- acquire-env!
   "open-env!, held by one more store of this process."
   [path opts]
