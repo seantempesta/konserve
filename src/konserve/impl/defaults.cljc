@@ -73,6 +73,14 @@
 
 #?(:cljs (extend-type js/Uint8Array ICounted (-count [this] (alength this))))
 
+(defn- defers-immutable-sync?
+  "Does a write to this store defer an absent immutable key's sync (`sync-plan`)?
+   The store opted in (`:defer-immutable-sync?`, durable writes, not in place) and
+   its backing can (`PDataSyncBackingStore`)."
+  [backing config]
+  (and (:defer-immutable-sync? config) (:sync-blob? config) (not (:in-place? config))
+       (satisfies? PDataSyncBackingStore backing) (-deferred-sync? backing)))
+
 (defn sync-plan
   "How `update-blob` makes one write durable.
    :per-write  the writer's `-sync`, move, `-sync-store` (no opt-in, or a backing
@@ -86,9 +94,7 @@
                becomes visible."
   [backing config immutable? existed?]
   (cond
-    (not (and (:defer-immutable-sync? config) (:sync-blob? config) (not (:in-place? config))
-              (satisfies? PDataSyncBackingStore backing) (-deferred-sync? backing)))
-    :per-write
+    (not (defers-immutable-sync? backing config)) :per-write
     (and immutable? (false? existed?)) :deferred
     :else :barriered))
 
@@ -646,14 +652,15 @@
 (defn io-operation
   "Read/Write blob. For better understanding use the flow-chart of konserve.
 
-  A store deferring immutable syncs (`:defer-immutable-sync?`) needs a write's
+  A store deferring immutable syncs (`defers-immutable-sync?`) needs a write's
   destination existence from BEFORE `-create-blob` opens it with CREATE
-  (`sync-plan`): probed here and handed on as `:existed?`. Outside
+  (`sync-plan`): probed here and handed on as `:existed?`; a store that cannot
+  defer is not probed. Outside
   `io-operation*`, whose go block is at the JVM's 64 KB method limit."
   [store serializers read-handlers write-handlers
    {:keys [operation sync? config key-vec] :as env}]
-  (if (and (:defer-immutable-sync? config)
-           (#{:write-edn :write-binary} operation))
+  (if (and (#{:write-edn :write-binary} operation)
+           (defers-immutable-sync? (:backing store) config))
     (async+sync
      sync? *default-sync-translation*
      (go-try-
