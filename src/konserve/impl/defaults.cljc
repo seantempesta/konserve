@@ -156,6 +156,14 @@
 (defn- refuse-plaintext-binary? [enc env]
   (and (encrypting? enc) (not (:raw? env))))
 
+(defn- aad
+  "The associated data `enc` binds `part` of `store-key`'s blob to, or nil when
+  `enc` does not encrypt: the null encryptor reads none, and building it was a
+  string and a byte array per part of every write and read."
+  [enc version store-key part]
+  (when (encrypting? enc)
+    (associated-data version store-key part)))
+
 (defn update-blob*
   "This function writes first the meta-size, then the meta-data and then the
   actual updated data into the underlying backing store."
@@ -190,7 +198,7 @@
           seal (fn [part value]
                  (-encrypt enc
                            (to-array value)
-                           (associated-data version store-key part)
+                           (aad enc version store-key part)
                            env))
 
           [input meta] (if (= operation :write-binary)
@@ -323,7 +331,7 @@
     (let [plaintext
           (<?- (-decrypt enc
                          bytes
-                         (associated-data version store-key part)
+                         (aad enc version store-key part)
                          env))]
       #?(:cljs (fn-read plaintext)
          :clj (with-open [input (ByteArrayInputStream. plaintext)]
@@ -1109,12 +1117,12 @@
                             meta (meta-up-fn key :edn old-meta)
                             meta-arr (<?- (-encrypt enc
                                                     (to-array meta)
-                                                    (associated-data version store-key :meta)
+                                                    (aad enc version store-key :meta)
                                                     env))
                             meta-size (count meta-arr)
                             value-arr (<?- (-encrypt enc
                                                      (to-array val)
-                                                     (associated-data version store-key :value)
+                                                     (aad enc version store-key :value)
                                                      env))
                             header (create-header version
                                                   serializer compressor encryptor meta-size)
