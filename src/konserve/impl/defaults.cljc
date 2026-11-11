@@ -3,7 +3,10 @@
   (:require
    [clojure.core.async :refer [<! timeout] :as async]
    [clojure.string :refer [ends-with?]]
-   #?@(:clj [[hasch.benc :refer [-coerce digest]]
+   #?@(:jolt [[hasch.benc :refer [-coerce]]
+              [hasch.platform :refer [sha512-message-digest uuid5]]
+              [jolt.crypto :as crypto]]
+       :clj [[hasch.benc :refer [-coerce digest]]
              [hasch.platform :refer [sha512-message-digest uuid5]]]
        :cljs [[hasch.core :refer [uuid]]])
    [konserve.metrics :as metrics]
@@ -54,9 +57,12 @@
 (defn key->store-key
   "The file name of `key`: its `hasch.core/uuid`. On the JVM the uuid is made
   from the digest bytes, without the seq of unsigned longs `hasch.core/edn-hash`
-  builds and `hasch.platform/uuid5` turns back into bytes."
+  builds and `hasch.platform/uuid5` turns back into bytes. On Jolt the SHA-512
+  of the key's encoding is one libcrypto call: a MessageDigest there is a shim
+  whose getInstance, update and digest cost more than hashing a key's bytes."
   [key]
-  (str #?(:clj (uuid5 (digest (-coerce key sha512-message-digest {}) sha512-message-digest))
+  (str #?(:jolt (uuid5 (crypto/digest crypto/c-sha512 64 (-coerce key sha512-message-digest {})))
+          :clj (uuid5 (digest (-coerce key sha512-message-digest {}) sha512-message-digest))
           :cljs (uuid key))
        ".ksv"))
 

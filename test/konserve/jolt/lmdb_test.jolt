@@ -10,7 +10,10 @@
             [konserve.impl.storage-layout :as sl]
             [konserve.jolt.filestore :as jfs]
             [konserve.jolt.lmdb :as lmdb]
-            [konserve.jolt.posix :as p]))
+            [konserve.jolt.posix :as p]
+            [hasch.benc]
+            [hasch.core]
+            [hasch.platform]))
 
 (defn- with-store [f]
   (let [path (str (System/getProperty "java.io.tmpdir") "/konserve-lmdb-test-" (random-uuid))
@@ -68,3 +71,49 @@
       (is (= [other] (lmdb/close-envs-under! other)))
       (finally (doseq [path [a b other]] (lmdb/close-env! path))
                (clojure.java.shell/sh "rm" "-rf" base other)))))
+
+(defn- store-key-by-hasch
+  "key->store-key as it was before its digest was one libcrypto call: hasch's
+  coercion, a MessageDigest, then uuid5. The reference the new one must equal."
+  [key]
+  (str (hasch.platform/uuid5 (hasch.benc/digest (hasch.benc/-coerce key hasch.platform/sha512-message-digest {})
+                                                hasch.platform/sha512-message-digest))
+       ".ksv"))
+
+(defn- varied-keys
+  "200 keys of the shapes stores are handed: Datahike's node, commit and value
+  addresses (uuids), branch heads and its own keys (keywords), commit-graph keys
+  ([:datahike/commit-graph cid]), and the rest of what hasch encodes."
+  []
+  (let [r (java.util.Random. 7)
+        uuid #(java.util.UUID. (.nextLong r) (.nextLong r))
+        kw #(keyword (str "k" (.nextInt r 1000)))
+        qkw #(keyword (str "datahike." (.nextInt r 50)) (str "n" (.nextInt r 1000)))
+        s #(apply str (repeatedly (.nextInt r 40) (fn [] (char (+ 1 (.nextInt r 200))))))]
+    (concat (repeatedly 50 uuid)
+            [:db :main :branches :datahike/collection :konserve/gc]
+            (repeatedly 15 kw)
+            (repeatedly 15 qkw)
+            (repeatedly 30 (fn [] [:datahike/commit-graph (uuid)]))
+            (repeatedly 10 (fn [] (vec (repeatedly (.nextInt r 4) uuid))))
+            (repeatedly 15 s)
+            [(apply str (repeat 1100 "x")) "" "\u0001\u001d" "naïve ✓"]
+            (repeatedly 10 #(.nextLong r))
+            (repeatedly 5 #(.nextDouble r))
+            [nil true false 'sym 'ns/sym (java.util.Date. 0) [] () '(:a 1) [[:a [1 (uuid)]]]
+             {:a 1 :b [2 3]} #{:x :y (uuid)} {} #{} (byte-array [1 2 3])
+             (list* (repeatedly 3 uuid)) {:branch :main :id (uuid)}]
+            (repeatedly 24 (fn [] {(kw) (uuid)})))))
+
+(deftest a-store-key-is-the-hasch-uuid-of-its-key
+  ;; one SHA-512 call names the same file as hasch's MessageDigest did, byte for
+  ;; byte, so a store written before reads after and the reverse
+  (let [ks (varied-keys)]
+    (is (= 200 (count ks)))
+    (is (= [] (vec (keep (fn [k] (let [old (store-key-by-hasch k) new (konserve.impl.defaults/key->store-key k)]
+                                   (when (not= old new) [k old new])))
+                         ks))))
+    (testing "and upstream's definition, hasch.core/uuid's"
+      (is (= [] (vec (keep (fn [k] (let [up (str (hasch.core/uuid k) ".ksv") new (konserve.impl.defaults/key->store-key k)]
+                                     (when (not= up new) [k up new])))
+                           ks)))))))
