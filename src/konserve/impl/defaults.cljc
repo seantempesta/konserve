@@ -1155,6 +1155,28 @@
       {:store-key-values store-key-values
        :processed-pairs results}))))
 
+;; jolt: an immutable key's value read without the key's lock, the existence and migration probes or
+;; the revision sidecar: a key written immutable (a content-addressed node) is never written again, only
+;; deleted by collection, so none of them can change what the read sees. Its header and value are read as
+;; any read reads them; a store with no encryption deserializes the value's bytes directly. An absent key is nil.
+;; Sync only: the caller is a sync reader (Datahike's node restore).
+(defn read-immutable
+  [{:keys [version backing serializers default-serializer compressor encryptor read-handlers buffer-size config]} key]
+  (let [env {:key-vec [key] :operation :read-edn :compressor compressor :encryptor encryptor :format :data
+             :version version :sync? true :buffer-size buffer-size :config config :default-serializer default-serializer
+             :store-key (key->store-key key) :header-size header-size
+             :msg {:type :read-edn-error :key key}}
+        blob (-create-blob backing (:store-key env) env)
+        header (try (read-header blob serializers env)
+                    (catch #?(:clj Exception :cljs js/Error) e (if (store-key-not-found? e) nil (throw e))))]
+   (when-let [[_ serializer compressor encryptor meta-size] header]
+    ;; no encryption, stored or configured (a store's plain case): the value's bytes go straight to
+    ;; its deserializer; anything else is read-blob's, which decrypts and checks
+    (assert-readable! encryptor (:encryptor config))
+    (if (encrypting? (encryptor (:encryptor config)))
+      (read-blob blob read-handlers serializers env)
+      (-deserialize (compressor serializer) read-handlers (-read-value blob meta-size env))))))
+
 (defrecord DefaultStore [version backing serializers default-serializer compressor encryptor
                          read-handlers write-handlers buffer-size locks config write-hooks]
   PEDNKeyValueStore

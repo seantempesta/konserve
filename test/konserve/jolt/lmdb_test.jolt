@@ -13,7 +13,8 @@
             [konserve.jolt.posix :as p]
             [hasch.benc]
             [hasch.core]
-            [hasch.platform]))
+            [hasch.platform]
+            [jolt.scheme :as scm]))
 
 (defn- with-store [f]
   (let [path (str (System/getProperty "java.io.tmpdir") "/konserve-lmdb-test-" (random-uuid))
@@ -117,3 +118,21 @@
       (is (= [] (vec (keep (fn [k] (let [up (str (hasch.core/uuid k) ".ksv") new (konserve.impl.defaults/key->store-key k)]
                                      (when (not= up new) [k up new])))
                            ks)))))))
+
+(deftest an-immutable-read-answers-what-get-answers
+  ;; k/get-immutable (a node's read: no lock, no probes, no revision) answers what get answers for a key
+  ;; written immutable, nil for an absent key, and allocates less than get (the lock, the probes and the
+  ;; read wrapper it skips: ~61 KB -> ~43 KB a Datahike node, 2026-11-12)
+  (with-store
+    (fn [store]
+      (let [v {:keys (vec (range 32)) :text (apply str (repeat 200 "x")) :at #inst "2026-11-12"}]
+        (k/assoc store :n v {:immutable? true} {:sync? true})
+        (is (= v (k/get-immutable store :n)) "the value get answers")
+        (is (= (k/get store :n nil {:sync? true}) (k/get-immutable store :n)))
+        (is (nil? (k/get-immutable store :absent)) "an absent key is nil")
+        (let [alloc (do (scm/eval-string "(define konserve-test-alloc (foreign-procedure \"(cs)thread_bytes_allocated\" () uptr))")
+                        (scm/proc "konserve-test-alloc"))
+              bytes (fn [f] (let [b0 (alloc) _ (dotimes [_ 20] (f))] (- (alloc) b0)))
+              g (bytes #(k/get store :n nil {:sync? true}))
+              i (bytes #(k/get-immutable store :n))]
+          (is (< i g) (str "an immutable read allocates less than get: " i " against " g)))))))

@@ -290,6 +290,16 @@
   ([store key not-found opts]
    (get-in store [key] not-found opts)))
 
+(defn get-immutable
+  "The value stored at key, a key written immutable (written once, as a content-addressed
+   node is: {:immutable? true} at its write), read synchronously without the key's lock, the
+   store's probes or a revision: none can change what it reads. nil when key is absent.
+   Only on a konserve.impl.defaults store; anything else reads through get."
+  [store key]
+  (if (instance? konserve.impl.defaults.DefaultStore store)
+    (defaults/read-immutable store key)
+    (get store key nil {:sync? true})))
+
 (defn get-meta
   "Returns the value stored described by key. Returns nil if the key
    is not present, or the not-found value if supplied."
