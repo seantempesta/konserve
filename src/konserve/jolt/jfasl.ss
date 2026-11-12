@@ -218,20 +218,10 @@
     (bytevector-truncate! buf pos)
     buf))
 
-(define kjc-hex "0123456789abcdef")
-;; the juuid record's own field constructor (s msb lsb): the halves are read from the bytes,
-;; not parsed back out of the string the protocol constructor would take
-(define kjc-make-juuid
-  (record-constructor (make-record-constructor-descriptor (record-type-descriptor juuid) #f #f)))
+;; a stored uuid is its two halves: the record holds them and no text (str writes it from
+;; them when asked, Jolt's natives-misc.ss juuid-s), so a node's 32 addresses cost no strings
 (define (kjc-uuid bv at)
-  (let ((s (make-string 36 #\-)))
-    (define (hex! b i)
-      (let ((x (bytevector-u8-ref bv (fx+ at b))))
-        (string-set! s i (string-ref kjc-hex (fxsrl x 4)))
-        (string-set! s (fx+ i 1) (string-ref kjc-hex (fxand x 15)))))
-    (hex! 0 0) (hex! 1 2) (hex! 2 4) (hex! 3 6) (hex! 4 9) (hex! 5 11) (hex! 6 14) (hex! 7 16)
-    (hex! 8 19) (hex! 9 21) (hex! 10 24) (hex! 11 26) (hex! 12 28) (hex! 13 30) (hex! 14 32) (hex! 15 34)
-    (kjc-make-juuid s (bytevector-u64-ref bv at (endianness big)) (bytevector-u64-ref bv (fx+ at 8) (endianness big)))))
+  (make-juuid (bytevector-u64-ref bv at (endianness big)) (bytevector-u64-ref bv (fx+ at 8) (endianness big))))
 
 (define (kjc-decode bv)
   (let ((pos 0) (names (make-vector 16)) (nnames 0))
