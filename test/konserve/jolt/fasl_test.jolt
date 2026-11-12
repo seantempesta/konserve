@@ -72,3 +72,26 @@
 (deftest a-lazy-seq-from-map-round-trips
   (is (= (quote (1)) (rt (map identity (list 1)))))
   (is (= (quote (1 2)) (rt (doall (map inc (concat [0] [1] ())))))))
+
+(deftest sorted-collections-keep-their-order-and-type
+  ;; a sorted map or set by the default comparator stores as its entries in order and comes back
+  ;; sorted (an agent's write of one was refused: no stable encoding for PersistentTreeMap)
+  (doseq [v [(sorted-map) (sorted-map 3 :c 1 :a 2 :b) (sorted-map "b" [1] "a" {:x (sorted-set 2 1)})
+             (sorted-set) (sorted-set 5 1 3) (sorted-set :b :a) (with-meta (sorted-map :k 1) {:m 1})]]
+    (let [w (rt v)]
+      (is (= v w))
+      (is (sorted? w))
+      (is (= (seq v) (seq w)) "the same order")
+      (is (= (meta v) (meta w)))))
+  (testing "a comparator is a function: it has no stable encoding, and the error says the comparator"
+    (is (thrown? Throwable (c/encode (sorted-map-by > 1 :a))))))
+
+(deftest queues-keep-their-order
+  ;; clojure.lang.PersistentQueue stores front to back and comes back a queue
+  (doseq [v [clojure.lang.PersistentQueue/EMPTY (conj clojure.lang.PersistentQueue/EMPTY 1 2 3)
+             (pop (conj clojure.lang.PersistentQueue/EMPTY :a :b :c))]]
+    (let [w (rt v)]
+      (is (= v w))
+      (is (= (type v) (type w)))
+      (is (= (seq v) (seq w)))
+      (is (= (peek v) (peek w))))))

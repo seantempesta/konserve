@@ -24,7 +24,10 @@
 ;;     count), then the fields in declared order and the extension map (nil when none)
 ;;  27 an instance of a type with a registered handler: name reference, (new) the tag string,
 ;;     then (dump x)
-;;  28 metadata: the meta value, then the value it is attached to (vector, map, set, list, symbol)
+;;  28 metadata: the meta value, then the value it is attached to (vector, map, set, list, symbol, sorted)
+;;  29 sorted map by the default comparator: n, n keys and values in order (comes back a sorted map)
+;;  30 sorted set by the default comparator: n, n values in order (comes back a sorted set)
+;;  31 queue (clojure.lang.PersistentQueue): n, n values front to back (comes back a queue)
 ;;
 ;; A name reference is a varint i: 0 introduces a new name (its strings follow and it takes the
 ;; next index); i > 0 repeats name i-1. Keywords, symbols and type tags share the per-message
@@ -34,8 +37,9 @@
 ;; - A deftype's fields travel as the runtime holds them, cached hashes included (Datahike's
 ;;   Datom keeps its hash in a field). That hash is Clojure's specified hash of the other fields,
 ;;   so it is the same in every build that implements Clojure's hash.
-;; - A seq comes back a list; a lazy seq is forced. Sorted collections, functions, atoms and
-;;   other reference types have no encoding and raise an error naming the type.
+;; - A seq comes back a list; a lazy seq is forced. A sorted collection by the default comparator
+;;   is its entries in order; one by a comparator of its own holds a function, and functions, atoms
+;;   and other reference types have no encoding and raise an error naming the type.
 
 ;; handlers by type tag: tag -> (dump . restore)
 (define kjc-handlers (make-hashtable string-hash string=?))
@@ -160,6 +164,22 @@
          (meta! (pset-meta x))
          (u8! 19) (uvar! (pset-count x))
          (pset-fold x (lambda (e acc) (w e) acc) #f))
+        ;; a sorted map or set by the default comparator (its cmp nil): its entries in order
+        ((and (scoll? x) (let ((c (scoll-cmp x))) (or (not c) (jolt-nil? c))))
+         (meta! (jolt-meta x))
+         (u8! (if (eq? (scoll-kind x) 'map) 29 30)) (uvar! (scoll-cnt x))
+         (let loop ((s (jolt-seq x)))
+           (unless (jolt-nil? s)
+             (let ((e (seq-first s)))
+               (if (eq? (scoll-kind x) 'map) (begin (w (jolt-nth e 0)) (w (jolt-nth e 1))) (w e)))
+             (loop (jolt-seq (seq-more s))))))
+        ((jolt-queue? x)
+         (meta! (jolt-meta x))
+         (u8! 31) (uvar! (jolt-queue-cnt x))
+         (let loop ((s (jolt-seq x)))
+           (unless (jolt-nil? s) (w (seq-first s)) (loop (jolt-seq (seq-more s))))))
+        ((scoll? x)
+         (error 'konserve.jolt.fasl "no stable encoding for a sorted collection with a comparator function of its own" (jolt-class-name x)))
         ((cseq? x) (meta! (cseq-meta x)) (seq! x))
         ((empty-list-t? x) (meta! (empty-list-t-meta x)) (u8! 20) (u8! 21))
         ((jolt-lazyseq? x) (seq! x))
@@ -330,6 +350,10 @@
                               (ref i))))
                   ((cdr h) (r))))
           ((28) (let* ((m (r)) (x (r))) (jolt-with-meta x m)))
+          ((31) (let ((n (uvar)))
+                  (let loop ((i 0) (q jolt-queue-empty)) (if (fx< i n) (loop (fx+ i 1) (queue-conj q (r))) q))))
+          ((29 30) (let* ((n (uvar)) (xs (vector->list (rd-vector (if (fx= t 29) (fx* 2 n) n)))))
+                     (apply jolt-invoke (var-deref "clojure.core" (if (fx= t 29) "sorted-map" "sorted-set")) xs)))
           (else (error 'konserve.jolt.fasl "unknown tag byte" t (fx- pos 1))))))
     (unless (and (fx>= (bytevector-length bv) 2)
                  (fx= (bytevector-u8-ref bv 0) #x4A)
