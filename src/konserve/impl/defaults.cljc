@@ -1175,7 +1175,9 @@
     (assert-readable! encryptor (:encryptor config))
     (if (encrypting? (encryptor (:encryptor config)))
       (read-blob blob read-handlers serializers env)
-      (-deserialize (compressor serializer) read-handlers (-read-value blob meta-size env))))))
+      #?(:cljs (-deserialize (compressor serializer) read-handlers (-read-value blob meta-size env))
+         :clj (with-open [input (ByteArrayInputStream. (-read-value blob meta-size env))]
+                (-deserialize (compressor serializer) read-handlers input)))))))
 
 (defrecord DefaultStore [version backing serializers default-serializer compressor encryptor
                          read-handlers write-handlers buffer-size locks config write-hooks]
