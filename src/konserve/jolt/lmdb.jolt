@@ -141,7 +141,16 @@
 (defrecord BackingLmdb [db]
   PBackingStore
   (-create-blob [_ store-key env]
-    (sync-or-go env (blob db store-key (l/read-txn db #(l/get-bytes db % store-key)))))
+    ;; a read of the metadata alone (konserve's key listing, k/revision) takes the header and
+    ;; the metadata, never the value: the whole value was copied out to read its header, a
+    ;; node's ~11 KB per key listed
+    (sync-or-go env (blob db store-key
+                          (l/read-txn db (if (= :read-meta (:operation env))
+                                           #(l/get-prefix db % store-key header-size
+                                                          (fn [head] (if (< (alength ^bytes head) header-size)
+                                                                       (alength ^bytes head)
+                                                                       (+ header-size (sl/read-meta-size head)))))
+                                           #(l/get-bytes db % store-key))))))
   (-delete-blob [_ store-key env]
     (sync-or-go env (l/write-txn db #(l/del! db % store-key))))
   (-blob-exists? [_ store-key env]

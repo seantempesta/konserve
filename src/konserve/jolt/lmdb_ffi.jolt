@@ -163,6 +163,23 @@
                     (let [n (val-size dv)]
                       (if (zero? n) (byte-array 0) (ffi/read-array (val-data dv) n)))))))))
 
+;; what a reader of a value's metadata takes: the head of the value, never the rest of it
+(defn get-prefix
+  "The first bytes of key k's value in txn, or nil: (want head) of them, head being its first
+  h bytes (fewer when the value is shorter), never more than the value holds. The bytes are
+  copied out of the map; the rest of the value is not touched."
+  [{:keys [dbi]} txn k h want]
+  (with-key k
+    (fn [kv dv]
+      (let [rc (mdb-get txn dbi kv dv)]
+        (cond
+          (= rc MDB_NOTFOUND) nil
+          :else (do (check "get" rc)
+                    (let [size (val-size dv) p (val-data dv)
+                          head (if (zero? size) (byte-array 0) (ffi/read-array p (min h size)))
+                          n (min size (long (want head)))]
+                      (if (<= n (alength ^bytes head)) head (ffi/read-array p n)))))))))
+
 (defn exists-in? [{:keys [dbi]} txn k]
   (with-key k (fn [kv dv] (let [rc (mdb-get txn dbi kv dv)]
                             (if (= rc MDB_NOTFOUND) false (do (check "get" rc) true))))))
