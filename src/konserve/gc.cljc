@@ -107,7 +107,13 @@
    before the backing store performs its first existence check or deletion, for
    a store without multi-key deletes. The callback runs synchronously; returning
    normally admits that batch, while throwing prevents the backing store from
-   seeing it."
+   seeing it.
+
+   The optional `:konserve.gc/batch-done` callback receives each batch's vector of
+   logical keys after its deletes are done, on every path but a dry run. It runs
+   synchronously: a caller whose store reuses freed space only once it is made
+   durable (LMDB under MDB_SAFENOSYNC) syncs there, or a long sweep grows the
+   store by every page it touches."
   ([store whitelist cutoff]
    (sweep! store whitelist cutoff 1000 {}))
   ([store whitelist cutoff batch-size]
@@ -137,25 +143,31 @@
             (reduce<?-
              (fn [deleted-files batch]
                (go-try-
-                (cond
-                  (:konserve.gc/dry-run? opts)
-                  (into deleted-files (map :key batch))
+                (let [deleted
+                      (cond
+                        (:konserve.gc/dry-run? opts)
+                        (into deleted-files (map :key batch))
 
-                  ;; one round trip for the whole batch where the backing allows it
-                  (utils/multi-key-capable? store)
-                  (let [keys-to-delete (mapv :key batch)]
-                    (if sync-io?
-                      (k/multi-dissoc store keys-to-delete (assoc opts :sync? true))
-                      (<?- (k/multi-dissoc store keys-to-delete (assoc opts :sync? false))))
-                    (into deleted-files keys-to-delete))
+                        ;; one round trip for the whole batch where the backing allows it
+                        (utils/multi-key-capable? store)
+                        (let [keys-to-delete (mapv :key batch)]
+                          (if sync-io?
+                            (k/multi-dissoc store keys-to-delete (assoc opts :sync? true))
+                            (<?- (k/multi-dissoc store keys-to-delete (assoc opts :sync? false))))
+                          (into deleted-files keys-to-delete))
 
-                  :else
-                  (do (when-let [batch-issued (:konserve.gc/batch-issued opts)]
-                        (batch-issued (mapv (comp defaults/key->store-key :key) batch)))
-                      (if sync?
-                        (delete-batch! store batch true)
-                        (<?- (delete-batch! store batch false)))
-                      (into deleted-files (map :key batch))))))
+                        :else
+                        (do (when-let [batch-issued (:konserve.gc/batch-issued opts)]
+                              (batch-issued (mapv (comp defaults/key->store-key :key) batch)))
+                            (if sync?
+                              (delete-batch! store batch true)
+                              (<?- (delete-batch! store batch false)))
+                            (into deleted-files (map :key batch))))]
+                  ;; after the batch's deletes are done: a store that frees pages only once they are made durable
+                  ;; (LMDB under MDB_SAFENOSYNC) is synced here by its caller, so a long sweep reuses what it frees
+                  (when-let [batch-done (and (not (:konserve.gc/dry-run? opts)) (:konserve.gc/batch-done opts))]
+                    (batch-done (mapv :key batch)))
+                  deleted)))
              #{}
              to-delete))]
        (if (:konserve.gc/report? opts)
