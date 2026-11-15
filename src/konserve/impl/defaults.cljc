@@ -1160,7 +1160,24 @@
 ;; deleted by collection, so none of them can change what the read sees. Its header and value are read as
 ;; any read reads them; a store with no encryption deserializes the value's bytes directly. An absent key is nil.
 ;; Sync only: the caller is a sync reader (Datahike's node restore).
+(declare read-immutable*)
+
 (defn read-immutable
+  "The value of immutable key on store, or nil when absent: timed as every other read is, one :read-immutable event at :io
+   when a sink is installed (konserve.metrics), nothing when none is."
+  [store key]
+  (let [t0 (metrics/start)]
+    (if-not t0
+      (read-immutable* store key)
+      (try
+        (let [r (read-immutable* store key)]
+          (metrics/finish! (:config store) :read-immutable :io t0)
+          r)
+        (catch #?(:clj Throwable :cljs :default) e
+          (metrics/finish! (:config store) :read-immutable :io t0 e)
+          (throw e))))))
+
+(defn- read-immutable*
   [{:keys [version backing serializers default-serializer compressor encryptor read-handlers buffer-size config]} key]
   (let [env {:key-vec [key] :operation :read-edn :compressor compressor :encryptor encryptor :format :data
              :version version :sync? true :buffer-size buffer-size :config config :default-serializer default-serializer
