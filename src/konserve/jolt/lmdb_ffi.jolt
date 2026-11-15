@@ -59,7 +59,9 @@
         (check "env_set_mapsize" (mdb-env-set-mapsize env map-size))
         (check "env_set_maxreaders" (mdb-env-set-maxreaders env max-readers))
         (check "env_open" (mdb-env-open env path (bit-or MDB_NOTLS flags) 0664))
-        (check "txn_begin" (mdb-txn-begin env ffi/null 0 pp))
+        ;; the main dbi opens in a read txn on a read-only env (a write txn is MDB_IS_READONLY there): a process reading beside
+        ;; the writer, as a candidate binary does, opens the store without the write lock
+        (check "txn_begin" (mdb-txn-begin env ffi/null (bit-and flags MDB_RDONLY) pp))
         (let [txn (ffi/read pp :pointer)
               dp (ffi/alloc :uint32)]
           (try
