@@ -200,7 +200,7 @@
 
 (defn connect-lmdb-store
   "A konserve store in LMDB env directory `path`. Options as
-  konserve.filestore/connect-fs-store plus :lmdb {:map-size :max-readers :flags}."
+  konserve.filestore/connect-fs-store plus :lmdb {:map-size :max-readers :flags :sync-pages}."
   [path & {:keys [config lmdb] :as params}]
   (let [db (acquire-env! path lmdb)
         store-config (merge {:buffer-size (* 1024 1024)

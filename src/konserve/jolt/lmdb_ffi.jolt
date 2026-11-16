@@ -25,6 +25,8 @@
 (ffi/defcfn mdb-env-create "mdb_env_create" [:pointer] :int)
 (ffi/defcfn mdb-env-set-mapsize "mdb_env_set_mapsize" [:pointer :size_t] :int)
 (ffi/defcfn mdb-env-set-maxreaders "mdb_env_set_maxreaders" [:pointer :uint] :int)
+(ffi/defcfn mdb-env-set-syncpages "mdb_env_set_syncpages" [:pointer :size_t] :int)
+(ffi/defcfn mdb-env-info "mdb_env_info" [:pointer :pointer] :int)
 (ffi/defcfn mdb-env-open "mdb_env_open" [:pointer :string :uint :int] :int)
 (ffi/defcfn mdb-env-close "mdb_env_close" [:pointer] :void)
 (ffi/defcfn mdb-env-sync "mdb_env_sync" [:pointer :int] :int {:blocking true})
@@ -50,14 +52,16 @@
 
 (defn open-env
   "Open (creating) the env directory `path`. Answers {:env ptr :dbi n :path :open?}, :open? an atom
-  close-env sets false."
-  [path {:keys [map-size max-readers flags] :or {map-size (* 1024 1024 1024) max-readers 126 flags 0}}]
+  close-env sets false. :sync-pages bounds the pages this process's commits free before one of them
+  makes a steady point itself (mdb_env_set_syncpages, our LMDB's MDB_SAFENOSYNC); none when absent."
+  [path {:keys [map-size max-readers flags sync-pages] :or {map-size (* 1024 1024 1024) max-readers 126 flags 0}}]
   (let [pp (ffi/alloc :pointer)]
     (try
       (check "env_create" (mdb-env-create pp))
       (let [env (ffi/read pp :pointer)]
         (check "env_set_mapsize" (mdb-env-set-mapsize env map-size))
         (check "env_set_maxreaders" (mdb-env-set-maxreaders env max-readers))
+        (when sync-pages (check "env_set_syncpages" (mdb-env-set-syncpages env sync-pages)))
         (check "env_open" (mdb-env-open env path (bit-or MDB_NOTLS flags) 0664))
         ;; the main dbi opens in a read txn on a read-only env (a write txn is MDB_IS_READONLY there): a process reading beside
         ;; the writer, as a candidate binary does, opens the store without the write lock
@@ -234,6 +238,18 @@
       (finally (ffi/free buf)))))
 
 (defn sync! [db] (check "env_sync" (mdb-env-sync (live-env db) 1)))
+
+(defn env-info
+  "The env's state, mdb_env_info: {:map-bytes :last-page :last-txn :max-readers :readers}. :last-page + 1
+  is the pages the file uses."
+  [db]
+  ;; MDB_envinfo: void *me_mapaddr; mdb_size_t me_mapsize, me_last_pgno, me_last_txnid; unsigned me_maxreaders, me_numreaders
+  (let [p (ffi/alloc 48)]
+    (try
+      (check "env_info" (mdb-env-info (live-env db) p))
+      {:map-bytes (ffi/read p :size_t 8) :last-page (ffi/read p :size_t 16) :last-txn (ffi/read p :size_t 24)
+       :max-readers (ffi/read p :uint32 32) :readers (ffi/read p :uint32 36)}
+      (finally (ffi/free p)))))
 
 (defn reader-check
   "Clear stale reader slots of dead processes; answers the count cleared."
