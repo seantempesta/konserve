@@ -42,7 +42,6 @@
 (ffi/defcfn mdb-cursor-get "mdb_cursor_get" [:pointer :pointer :pointer :int] :int)
 (ffi/defcfn mdb-cursor-close "mdb_cursor_close" [:pointer] :void)
 (ffi/defcfn mdb-strerror "mdb_strerror" [:int] :string)
-(ffi/defcfn mdb-reader-check "mdb_reader_check" [:pointer :pointer] :int)
 (ffi/defcfn mdb-env-copy2 "mdb_env_copy2" [:pointer :pointer :uint] :int {:blocking true})
 (def MDB_CP_COMPACT 1)
 
@@ -254,13 +253,6 @@
       {:map-bytes (ffi/read p :size_t 8) :last-page (ffi/read p :size_t 16) :last-txn (ffi/read p :size_t 24)
        :steady-txn (ffi/read p :size_t 48) :max-readers (ffi/read p :uint32 32) :readers (ffi/read p :uint32 36)}
       (finally (ffi/free p)))))
-
-(defn reader-check
-  "Clear stale reader slots of dead processes; answers the count cleared."
-  [db]
-  (let [p (ffi/alloc :int32)]
-    (try (check "reader_check" (mdb-reader-check (live-env db) p)) (ffi/read p :int32)
-         (finally (ffi/free p)))))
 
 (defn compact-copy!
   "Write a compacted copy of the env to directory dst (which must exist and hold no
