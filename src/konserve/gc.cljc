@@ -165,7 +165,9 @@
                                       (when (seq ks)
                                         (if (utils/multi-key-capable? store)
                                           (k/multi-dissoc store ks (assoc opts :sync? true))
-                                          (delete-batch! store (mapv by-key ks) true)))))]
+                                          (do (when-let [batch-issued (:konserve.gc/batch-issued opts)]
+                                                (batch-issued (mapv defaults/key->store-key ks)))
+                                              (delete-batch! store (mapv by-key ks) true))))))]
                           (into deleted-files gone))
 
                         ;; one round trip for the whole batch where the backing allows it
