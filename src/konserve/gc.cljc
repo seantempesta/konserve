@@ -109,6 +109,13 @@
    normally admits that batch, while throwing prevents the backing store from
    seeing it.
 
+   The optional `:konserve.gc/admit` function, (admit keys delete!), runs each batch's deletes on a
+   synchronous sweep (`:konserve.gc/sync-io?`) of a multi-key store: it is
+   handed the batch's logical keys and a function deleting the keys it is given, and answers the keys it
+   deleted. A caller whose writers name existing keys again while the sweep runs (a content-addressed
+   value reused, not written) spares those here, under its own exclusion with them; without it every
+   key of the batch is deleted.
+
    The optional `:konserve.gc/batch-done` callback receives each batch's vector of
    logical keys after its deletes are done, on every path but a dry run. It runs
    synchronously: a caller whose store reuses freed space only once it is made
@@ -148,12 +155,16 @@
                         (:konserve.gc/dry-run? opts)
                         (into deleted-files (map :key batch))
 
-                        ;; one round trip for the whole batch where the backing allows it
+                        ;; one round trip for the whole batch where the backing allows it; a caller's admit
+                        ;; decides which of the batch's keys go, and deletes them in its own exclusion
+                        (and sync-io? (utils/multi-key-capable? store))
+                        (let [admit (or (:konserve.gc/admit opts) (fn [ks delete!] (delete! ks) ks))
+                              gone (admit (mapv :key batch) (fn [ks] (when (seq ks) (k/multi-dissoc store ks (assoc opts :sync? true)))))]
+                          (into deleted-files gone))
+
                         (utils/multi-key-capable? store)
                         (let [keys-to-delete (mapv :key batch)]
-                          (if sync-io?
-                            (k/multi-dissoc store keys-to-delete (assoc opts :sync? true))
-                            (<?- (k/multi-dissoc store keys-to-delete (assoc opts :sync? false))))
+                          (<?- (k/multi-dissoc store keys-to-delete (assoc opts :sync? false)))
                           (into deleted-files keys-to-delete))
 
                         :else
