@@ -109,8 +109,8 @@
    normally admits that batch, while throwing prevents the backing store from
    seeing it.
 
-   The optional `:konserve.gc/admit` function, (admit keys delete!), runs each batch's deletes on a
-   synchronous sweep (`:konserve.gc/sync-io?`) of a multi-key store: it is
+   The optional `:konserve.gc/admit` function, (admit keys delete!), runs each batch's deletes, on any
+   path (the deletes it calls run synchronously inside it): it is
    handed the batch's logical keys and a function deleting the keys it is given, and answers the keys it
    deleted. A caller whose writers name existing keys again while the sweep runs (a content-addressed
    value reused, not written) spares those here, under its own exclusion with them; without it every
@@ -155,12 +155,24 @@
                         (:konserve.gc/dry-run? opts)
                         (into deleted-files (map :key batch))
 
-                        ;; one round trip for the whole batch where the backing allows it; a caller's admit
-                        ;; decides which of the batch's keys go, and deletes them in its own exclusion
-                        (and sync-io? (utils/multi-key-capable? store))
-                        (let [admit (or (:konserve.gc/admit opts) (fn [ks delete!] (delete! ks) ks))
-                              gone (admit (mapv :key batch) (fn [ks] (when (seq ks) (k/multi-dissoc store ks (assoc opts :sync? true)))))]
+                        ;; a caller's admit decides which of the batch's keys go and deletes them in its own exclusion:
+                        ;; the deletes run synchronously inside it, on any path
+                        (:konserve.gc/admit opts)
+                        (let [by-key (into {} (map (juxt :key identity)) batch)
+                              gone ((:konserve.gc/admit opts)
+                                    (mapv :key batch)
+                                    (fn [ks]
+                                      (when (seq ks)
+                                        (if (utils/multi-key-capable? store)
+                                          (k/multi-dissoc store ks (assoc opts :sync? true))
+                                          (delete-batch! store (mapv by-key ks) true)))))]
                           (into deleted-files gone))
+
+                        ;; one round trip for the whole batch where the backing allows it
+                        (and sync-io? (utils/multi-key-capable? store))
+                        (let [keys-to-delete (mapv :key batch)]
+                          (k/multi-dissoc store keys-to-delete (assoc opts :sync? true))
+                          (into deleted-files keys-to-delete))
 
                         (utils/multi-key-capable? store)
                         (let [keys-to-delete (mapv :key batch)]
