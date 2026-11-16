@@ -50,19 +50,33 @@
     (throw (ex-info (str "lmdb " op ": " (mdb-strerror rc)) {:op op :rc rc :type :lmdb-error})))
   rc)
 
+(def MDB_ALONE 0x1000)
+(def MDB_ENV_BUSY -30771)
+
 (defn open-env
   "Open (creating) the env directory `path`. Answers {:env ptr :dbi n :path :open?}, :open? an atom
   close-env sets false. :sync-pages bounds the pages this process's commits free before one of them
-  makes a steady point itself (mdb_env_set_syncpages, our LMDB's MDB_SAFENOSYNC); none when absent."
+  makes a steady point itself (mdb_env_set_syncpages, our LMDB's MDB_SAFENOSYNC); none when absent.
+  :map-size sizes a store being made; an existing store opens at the map size it records, so two
+  processes never differ on it (no MDB_MAP_RESIZED). With MDB_ALONE in :flags the open is refused,
+  {:type :lmdb-not-alone}, while another process holds the store."
   [path {:keys [map-size max-readers flags sync-pages] :or {map-size (* 1024 1024 1024) max-readers 126 flags 0}}]
   (let [pp (ffi/alloc :pointer)]
     (try
       (check "env_create" (mdb-env-create pp))
       (let [env (ffi/read pp :pointer)]
-        (check "env_set_mapsize" (mdb-env-set-mapsize env map-size))
+        ;; LMDB adopts the size the store records when none is set (mdb_env_open2): only a new store takes ours
+        (when-not (.exists (java.io.File. (str path "/data.mdb")))
+          (check "env_set_mapsize" (mdb-env-set-mapsize env map-size)))
         (check "env_set_maxreaders" (mdb-env-set-maxreaders env max-readers))
         (when sync-pages (check "env_set_syncpages" (mdb-env-set-syncpages env sync-pages)))
-        (check "env_open" (mdb-env-open env path (bit-or MDB_NOTLS flags) 0664))
+        (let [rc (mdb-env-open env path (bit-or MDB_NOTLS flags) 0664)]
+          (when-not (zero? rc)
+            ;; a failed open leaves the handle to close
+            (mdb-env-close env)
+            (if (= rc MDB_ENV_BUSY)
+              (throw (ex-info (str "lmdb env_open " path ": another process holds the store") {:type :lmdb-not-alone :path path :rc rc}))
+              (check "env_open" rc))))
         ;; the main dbi opens in a read txn on a read-only env (a write txn is MDB_IS_READONLY there): a process reading beside
         ;; the writer, as a candidate binary does, opens the store without the write lock
         (check "txn_begin" (mdb-txn-begin env ffi/null (bit-and flags MDB_RDONLY) pp))
