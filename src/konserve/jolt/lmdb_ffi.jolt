@@ -53,51 +53,18 @@
 (def MDB_ALONE 0x1000)
 (def MDB_ENV_BUSY -30771)
 
-(defn open-env
-  "Open (creating) the env directory `path`. Answers {:env ptr :dbi n :path :open?}, :open? an atom
-  close-env sets false. :sync-pages bounds the pages this process's commits free before one of them
-  makes a steady point itself (mdb_env_set_syncpages, our LMDB's MDB_SAFENOSYNC); none when absent.
-  :map-size sizes a store being made; an existing store opens at the map size it records, so two
-  processes never differ on it (no MDB_MAP_RESIZED). With MDB_ALONE in :flags the open is refused,
-  {:type :lmdb-not-alone}, while another process holds the store."
-  [path {:keys [map-size max-readers flags sync-pages] :or {map-size (* 1024 1024 1024) max-readers 126 flags 0}}]
-  (let [pp (ffi/alloc :pointer)]
-    (try
-      (check "env_create" (mdb-env-create pp))
-      (let [env (ffi/read pp :pointer)]
-        ;; LMDB adopts the size the store records when none is set (mdb_env_open2): only a new store takes ours
-        (when-not (.exists (java.io.File. (str path "/data.mdb")))
-          (check "env_set_mapsize" (mdb-env-set-mapsize env map-size)))
-        (check "env_set_maxreaders" (mdb-env-set-maxreaders env max-readers))
-        (when sync-pages (check "env_set_syncpages" (mdb-env-set-syncpages env sync-pages)))
-        (let [rc (mdb-env-open env path (bit-or MDB_NOTLS flags) 0664)]
-          (when-not (zero? rc)
-            ;; a failed open leaves the handle to close
-            (mdb-env-close env)
-            (if (= rc MDB_ENV_BUSY)
-              (throw (ex-info (str "lmdb env_open " path ": another process holds the store") {:type :lmdb-not-alone :path path :rc rc}))
-              (check "env_open" rc))))
-        ;; the main dbi opens in a read txn on a read-only env (a write txn is MDB_IS_READONLY there): a process reading beside
-        ;; the writer, as a candidate binary does, opens the store without the write lock
-        (check "txn_begin" (mdb-txn-begin env ffi/null (bit-and flags MDB_RDONLY) pp))
-        (let [txn (ffi/read pp :pointer)
-              dp (ffi/alloc :uint32)]
-          (try
-            (check "dbi_open" (mdb-dbi-open txn nil 0 dp))
-            (let [dbi (ffi/read dp :uint32)]
-              (check "txn_commit" (mdb-txn-commit txn))
-              {:env env :dbi dbi :path path :open? (atom true)})
-            (finally (ffi/free dp)))))
-      (finally (ffi/free pp)))))
-
 (defn close-env
-  "Close the env. Every transaction begun on it after answers :lmdb-env-closed (live-env):
-  a db value whose store was released reads its nodes lazily, and a read of a closed env's
-  map is an invalid memory reference that kills the process. A close racing a transaction
-  another thread already began is not covered: the caller closes after its reads."
-  [{:keys [env open?]}]
-  (reset! open? false)
-  (mdb-env-close env))
+  "Close the env under its exclusive write lock so all in-flight read/write txns and
+  adopt-mapsize! calls drain before munmap/mdb_env_close. Idempotent on double close."
+  [{:keys [env open? rw-lock]}]
+  (let [^java.util.concurrent.locks.ReentrantReadWriteLock rw rw-lock
+        wl (when rw (.writeLock rw))]
+    (when wl (.lock wl))
+    (try
+      (when @open?
+        (reset! open? false)
+        (mdb-env-close env))
+      (finally (when wl (.unlock wl))))))
 
 (defn- live-env
   "The env pointer of db, or the typed error when its env was closed (close-env): the store
@@ -137,14 +104,6 @@
   and write-txn of this thread runs in it, so they commit or abort together."
   nil)
 
-(defn read-txn
-  "Run (f txn) in a read-only transaction (in `transact`'s, when one is open)."
-  [db f]
-  (if-some [t *txn*]
-    (f t)
-    (let [txn (begin (live-env db) MDB_RDONLY)]
-      (try (f txn) (finally (mdb-txn-abort txn))))))
-
 (defn- commit-or-abort [txn f]
   (try
     (let [r (f txn)]
@@ -153,23 +112,6 @@
     (catch Throwable e
       (mdb-txn-abort txn)
       (throw e))))
-
-(defn write-txn
-  "Run (f txn) in a write transaction and commit it; abort on exception. Inside
-  `transact`, f runs in its transaction, which commits when `transact` ends."
-  [db f]
-  (if-some [t *txn*]
-    (f t)
-    (commit-or-abort (begin (live-env db) 0) f)))
-
-(defn transact
-  "Run (f) with every read-txn and write-txn of this thread inside one write transaction:
-  committed when f returns, aborted when it throws. LMDB has one writer per env across
-  processes, so nothing interleaves with it. Answers f's value."
-  [db f]
-  (if *txn*
-    (f)
-    (commit-or-abort (begin (live-env db) 0) (fn [txn] (binding [*txn* txn] (f))))))
 
 (defn get-bytes
   "Value bytes for key k in txn, or nil."
@@ -277,3 +219,141 @@
   (let [p (ffi/string->ptr dst)]
     (try (check "env_copy2" (mdb-env-copy2 (live-env db) p MDB_CP_COMPACT))
          (finally (ffi/free p)))))
+
+(def MDB_MAP_RESIZED -30785)
+
+(defn- env-map-bytes [env]
+  (let [p (ffi/alloc 56)]
+    (try
+      (check "env_info" (mdb-env-info env p))
+      (ffi/read p :size_t 8)
+      (finally (ffi/free p)))))
+
+(defn open-env
+  "Open (creating) the env directory `path`. Answers {:env ptr :dbi n :path :open? :rw-lock}, :open? an atom
+  close-env sets false. :sync-pages bounds the pages this process's commits free before one of them
+  makes a steady point itself (mdb_env_set_syncpages, our LMDB's MDB_SAFENOSYNC); none when absent.
+  :map-size sizes a new store and monotonically grows an existing writable store when larger than its
+  recorded map size (never shrinking an existing store). With MDB_ALONE in :flags the open is refused,
+  {:type :lmdb-not-alone}, while another process holds the store."
+  [path {:keys [map-size max-readers flags sync-pages] :or {map-size (* 1024 1024 1024) max-readers 126 flags 0}}]
+  (let [pp (ffi/alloc :pointer)
+        exists? (.exists (java.io.File. (str path "/data.mdb")))
+        rdonly? (pos? (bit-and flags MDB_RDONLY))]
+    (try
+      (check "env_create" (mdb-env-create pp))
+      (let [env (ffi/read pp :pointer)]
+        ;; LMDB adopts the size the store records when none is set (mdb_env_open2): a new store takes ours,
+        ;; and an existing store opens at its recorded size first so a smaller caller never shrinks it.
+        (when-not exists?
+          (check "env_set_mapsize" (mdb-env-set-mapsize env map-size)))
+        (check "env_set_maxreaders" (mdb-env-set-maxreaders env max-readers))
+        (when sync-pages (check "env_set_syncpages" (mdb-env-set-syncpages env sync-pages)))
+        (let [rc (mdb-env-open env path (bit-or MDB_NOTLS flags) 0664)]
+          (when-not (zero? rc)
+            (mdb-env-close env)
+            (if (= rc MDB_ENV_BUSY)
+              (throw (ex-info (str "lmdb env_open " path ": another process holds the store") {:type :lmdb-not-alone :path path :rc rc}))
+              (check "env_open" rc))))
+        ;; Post-open setup: on any failure, abort any open txn and close env so handles/reader slots never leak.
+        (let [txn-v (volatile! nil)]
+          (try
+            ;; Monotonically grow an existing writable store's map when requested :map-size exceeds its recorded size.
+            ;; Safe here: open-env runs under lmdb/envs lock before DBI open, so zero txns exist yet.
+            (when (and exists? (not rdonly?) map-size (> (long map-size) (long (env-map-bytes env))))
+              (check "env_set_mapsize" (mdb-env-set-mapsize env (long map-size))))
+            ;; the main dbi opens in a read txn on a read-only env (a write txn is MDB_IS_READONLY there)
+            (check "txn_begin" (mdb-txn-begin env ffi/null (bit-and flags MDB_RDONLY) pp))
+            (let [txn (ffi/read pp :pointer)
+                  _ (vreset! txn-v txn)
+                  dp (ffi/alloc :uint32)]
+              (try
+                (check "dbi_open" (mdb-dbi-open txn nil 0 dp))
+                (let [dbi (ffi/read dp :uint32)]
+                  (vreset! txn-v nil)
+                  (check "txn_commit" (mdb-txn-commit txn))
+                  {:env env :dbi dbi :path path :open? (atom true)
+                   :rw-lock (java.util.concurrent.locks.ReentrantReadWriteLock.)})
+                (finally (ffi/free dp))))
+            (catch Throwable e
+              (when-let [t @txn-v] (mdb-txn-abort t))
+              (mdb-env-close env)
+              (throw e)))))
+      (finally (ffi/free pp)))))
+
+(defn begin-raw
+  "Calls mdb_txn_begin and returns [rc txn-ptr-or-nil] without throwing."
+  [env flags]
+  (let [pp (ffi/alloc :pointer)]
+    (try
+      (let [rc (mdb-txn-begin env ffi/null flags pp)]
+        [rc (when (zero? rc) (ffi/read pp :pointer))])
+      (finally (ffi/free pp)))))
+
+(defn adopt-mapsize-unlocked!
+  "Adopts the store's grown map size via mdb_env_set_mapsize(env, 0). Caller MUST hold (:rw-lock db)'s write lock."
+  [db]
+  (check "env_set_mapsize" (mdb-env-set-mapsize (live-env db) 0)))
+
+(defn adopt-mapsize!
+  "Acquires db's exclusive write lock (draining all local read/write txns so munmap is safe) and
+  adopts the store's grown map size via mdb_env_set_mapsize(env, 0)."
+  [db]
+  (let [^java.util.concurrent.locks.ReentrantReadWriteLock rw (:rw-lock db)
+        wl (when rw (.writeLock rw))]
+    (when wl (.lock wl))
+    (try
+      (adopt-mapsize-unlocked! db)
+      (finally (when wl (.unlock wl))))))
+
+(defn- begin-locked [db flags]
+  (let [^java.util.concurrent.locks.ReentrantReadWriteLock rw (:rw-lock db)
+        rl (when rw (.readLock rw))]
+    (loop [tries 0]
+      (when rl (.lock rl))
+      (let [res (try
+                  (let [[rc txn] (begin-raw (live-env db) flags)]
+                    (cond
+                      (zero? rc) [rl txn]
+                      (and (= rc MDB_MAP_RESIZED) (< tries 2) rw (= 1 (.getReadHoldCount rw))) :resized
+                      :else (do (check "txn_begin" rc) [rl txn])))
+                  (catch Throwable e
+                    (when rl (.unlock rl))
+                    (throw e)))]
+        (if (= :resized res)
+          (do (when rl (.unlock rl))
+              (adopt-mapsize! db)
+              (recur (inc tries)))
+          res)))))
+
+(defn transact
+  "Run (f) with every read-txn and write-txn of this thread inside one write transaction:
+  committed when f returns, aborted when it throws. LMDB has one writer per env across
+  processes, so nothing interleaves with it. Answers f's value."
+  [db f]
+  (if *txn*
+    (f)
+    (let [[rl txn] (begin-locked db 0)]
+      (try (commit-or-abort txn (fn [t] (binding [*txn* t] (f))))
+           (finally (when rl (.unlock rl)))))))
+
+(defn write-txn
+  "Run (f txn) in a write transaction and commit it; abort on exception. Inside
+  `transact`, f runs in its transaction, which commits when `transact` ends."
+  [db f]
+  (if-some [t *txn*]
+    (f t)
+    (let [[rl txn] (begin-locked db 0)]
+      (try (commit-or-abort txn f)
+           (finally (when rl (.unlock rl)))))))
+
+(defn read-txn
+  "Run (f txn) in a read-only transaction (in `transact`'s, when one is open)."
+  [db f]
+  (if-some [t *txn*]
+    (f t)
+    (let [[rl txn] (begin-locked db MDB_RDONLY)]
+      (try (f txn)
+           (finally
+             (try (mdb-txn-abort txn)
+                  (finally (when rl (.unlock rl)))))))))
