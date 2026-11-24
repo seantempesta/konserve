@@ -223,6 +223,10 @@
 (define (kjc-uuid bv at)
   (make-juuid (bytevector-u64-ref bv at (endianness big)) (bytevector-u64-ref bv (fx+ at 8) (endianness big))))
 
+;; Detect once at load time whether this Jolt runtime's jrec constructors take the inline
+;; meta slot (4-arg header: desc ext hash meta) or pre-meta (3-arg: desc ext hash).
+(define kjc-jrec-has-meta? (logbit? 4 (procedure-arity-mask (vector-ref jrec-ctor-vec 0))))
+
 (define (kjc-decode bv)
   (let ((pos 0) (names (make-vector 16)) (nnames 0))
     (define (u8)
@@ -256,21 +260,35 @@
         (let loop ((i 0)) (when (fx< i n) (vector-set! v i (r)) (loop (fx+ i 1))))
         v))
     ;; fields are read in declared order, then the extension map; the per-arity native
-    ;; constructor (make-jrec would spread a vector through apply)
+    ;; constructor (make-jrec would spread a vector through apply).
     (define (rd-jrec d n)
-      (if (fx> n 8)
-          (let* ((vals (rd-vector n)) (ext (r))) (make-jrec* d ext 0 vals))
-          (let ((mk (vector-ref jrec-ctor-vec n)))
-            (case n
-              ((0) (mk d (r) 0))
-              ((1) (let* ((a (r)) (ext (r))) (mk d ext 0 a)))
-              ((2) (let* ((a (r)) (b (r)) (ext (r))) (mk d ext 0 a b)))
-              ((3) (let* ((a (r)) (b (r)) (c (r)) (ext (r))) (mk d ext 0 a b c)))
-              ((4) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (ext (r))) (mk d ext 0 a b c e)))
-              ((5) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (ext (r))) (mk d ext 0 a b c e f)))
-              ((6) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (g (r)) (ext (r))) (mk d ext 0 a b c e f g)))
-              ((7) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (g (r)) (h (r)) (ext (r))) (mk d ext 0 a b c e f g h)))
-              (else (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (g (r)) (h (r)) (i (r)) (ext (r))) (mk d ext 0 a b c e f g h i)))))))
+      (if kjc-jrec-has-meta?
+          (if (fx> n 8)
+              (let* ((vals (rd-vector n)) (ext (r))) (make-jrec* d ext 0 jolt-nil vals))
+              (let ((mk (vector-ref jrec-ctor-vec n)))
+                (case n
+                  ((0) (mk d (r) 0 jolt-nil))
+                  ((1) (let* ((a (r)) (ext (r))) (mk d ext 0 jolt-nil a)))
+                  ((2) (let* ((a (r)) (b (r)) (ext (r))) (mk d ext 0 jolt-nil a b)))
+                  ((3) (let* ((a (r)) (b (r)) (c (r)) (ext (r))) (mk d ext 0 jolt-nil a b c)))
+                  ((4) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (ext (r))) (mk d ext 0 jolt-nil a b c e)))
+                  ((5) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (ext (r))) (mk d ext 0 jolt-nil a b c e f)))
+                  ((6) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (g (r)) (ext (r))) (mk d ext 0 jolt-nil a b c e f g)))
+                  ((7) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (g (r)) (h (r)) (ext (r))) (mk d ext 0 jolt-nil a b c e f g h)))
+                  (else (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (g (r)) (h (r)) (i (r)) (ext (r))) (mk d ext 0 jolt-nil a b c e f g h i))))))
+          (if (fx> n 8)
+              (let* ((vals (rd-vector n)) (ext (r))) (make-jrec* d ext 0 vals))
+              (let ((mk (vector-ref jrec-ctor-vec n)))
+                (case n
+                  ((0) (mk d (r) 0))
+                  ((1) (let* ((a (r)) (ext (r))) (mk d ext 0 a)))
+                  ((2) (let* ((a (r)) (b (r)) (ext (r))) (mk d ext 0 a b)))
+                  ((3) (let* ((a (r)) (b (r)) (c (r)) (ext (r))) (mk d ext 0 a b c)))
+                  ((4) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (ext (r))) (mk d ext 0 a b c e)))
+                  ((5) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (ext (r))) (mk d ext 0 a b c e f)))
+                  ((6) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (g (r)) (ext (r))) (mk d ext 0 a b c e f g)))
+                  ((7) (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (g (r)) (h (r)) (ext (r))) (mk d ext 0 a b c e f g h)))
+                  (else (let* ((a (r)) (b (r)) (c (r)) (e (r)) (f (r)) (g (r)) (h (r)) (i (r)) (ext (r))) (mk d ext 0 a b c e f g h i))))))))
     (define (r)
       (let ((t (u8)))
         (case t

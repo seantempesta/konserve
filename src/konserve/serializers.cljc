@@ -330,9 +330,10 @@
   (-deserialize [_ read-handlers s]
     (read-string-safe @read-handlers
                       #?(:cljs s
-                         :clj (if (string? s)
-                                s
-                                (String. ^bytes (.readAllBytes ^java.io.InputStream s) "UTF-8")))))
+                         :clj (cond
+                                (string? s) s
+                                (bytes? s) (String. ^bytes s "UTF-8")
+                                :else (String. ^bytes (.readAllBytes ^java.io.InputStream s) "UTF-8")))))
   (-serialize [_ #?(:clj output-stream :cljs _) _ val]
     #?(:cljs (pr-str val)
        :clj (.write ^java.io.OutputStream output-stream

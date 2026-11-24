@@ -18,8 +18,11 @@
   (let [t (tag v)]
     (cond
       (= t leaf-tag) (tagged-literal 'pss/leaf (.keys v))
-      (= t branch-tag) (tagged-literal 'pss/branch {:level (.level v) :keys (.keys v) :addresses (.addresses v)
-                                                    :subtree-count (.-_subtreeCount v)})
+      (= t branch-tag) (let [sl (.slotsForStorage v)]
+                         (tagged-literal 'pss/branch
+                           (cond-> {:level (.level v) :keys (.keys v) :addresses (.addresses v)
+                                    :subtree-count (.-_subtreeCount v)}
+                             sl (assoc :slots sl))))
       (= t set-tag) (do (when-not (.-_address v) (throw (ex-info "unflushed index cannot be serialized" {})))
                         (tagged-literal 'pss/set {:address (.-_address v) :count (.-_count v) :meta (meta v)}))
       (map? v) (reduce-kv (fn [m k x] (let [y (freeze x)] (if (identical? x y) m (assoc m k y)))) v v)
