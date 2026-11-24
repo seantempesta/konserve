@@ -10,6 +10,7 @@
             [konserve.impl.storage-layout :as sl]
             [konserve.jolt.filestore :as jfs]
             [konserve.jolt.lmdb :as lmdb]
+            [konserve.jolt.lmdb-ffi :as lmdb-ffi]
             [konserve.jolt.posix :as p]
             [hasch.benc]
             [hasch.core]
@@ -136,3 +137,36 @@
               g (bytes #(k/get store :n nil {:sync? true}))
               i (bytes #(k/get-immutable store :n))]
           (is (< i g) (str "an immutable read allocates less than get: " i " against " g)))))))
+
+(deftest a-store-grows-automatically-on-map-full
+  ;; Starting at a tiny 128 KiB mapsize, writes exceeding the mapsize via both write-txn and
+  ;; batched transact automatically double the LMDB mapsize and retry, and a second reader env
+  ;; opened before growth adopts the new mapsize via MDB_MAP_RESIZED transparently.
+  (let [path (str (System/getProperty "java.io.tmpdir") "/konserve-lmdb-grow-" (random-uuid))]
+    (.mkdirs (java.io.File. path))
+    (let [writer (lmdb-ffi/open-env path {:map-size (* 128 1024)})
+          reader (lmdb-ffi/open-env path {:flags lmdb-ffi/MDB_RDONLY})
+          payload (byte-array (* 64 1024) (byte 42))]
+      (try
+        (is (= (* 128 1024) (:map-bytes (lmdb-ffi/env-info writer))))
+        ;; Individual write-txns exceeding 128 KiB -> triggers auto-grow multiple times
+        (dotimes [i 12]
+          (lmdb-ffi/write-txn writer (fn [txn] (lmdb-ffi/put-bytes! writer txn (str "w-" i) payload))))
+        ;; Batched transact exceeding the grown mapsize again in one multi-put txn
+        (lmdb-ffi/transact writer
+          (fn []
+            (dotimes [i 28]
+              (lmdb-ffi/write-txn writer (fn [txn] (lmdb-ffi/put-bytes! writer txn (str "b-" i) payload))))))
+        (let [final-map (:map-bytes (lmdb-ffi/env-info writer))]
+          (is (> final-map (* 2 1024 1024)) (str "map grew past 2 MiB: " final-map)))
+        ;; Both writer and previously-opened reader see every written key cleanly
+        (is (= (alength payload)
+               (alength ^bytes (lmdb-ffi/read-txn writer (fn [txn] (lmdb-ffi/get-bytes writer txn "b-27"))))))
+        (is (= (alength payload)
+               (alength ^bytes (lmdb-ffi/read-txn reader (fn [txn] (lmdb-ffi/get-bytes reader txn "b-27"))))))
+        (is (= (alength payload)
+               (alength ^bytes (lmdb-ffi/read-txn reader (fn [txn] (lmdb-ffi/get-bytes reader txn "w-0"))))))
+        (finally
+          (lmdb-ffi/close-env reader)
+          (lmdb-ffi/close-env writer)
+          (clojure.java.shell/sh "rm" "-rf" path))))))

@@ -105,13 +105,17 @@
   nil)
 
 (defn- commit-or-abort [txn f]
-  (try
-    (let [r (f txn)]
-      (check "txn_commit" (mdb-txn-commit txn))
-      r)
-    (catch Throwable e
-      (mdb-txn-abort txn)
-      (throw e))))
+  (let [committed? (volatile! false)]
+    (try
+      (let [r (f txn)]
+        (vreset! committed? true)
+        (check "txn_commit" (mdb-txn-commit txn))
+        r)
+      (catch Throwable e
+        ;; mdb_txn_commit always ends and frees txn even on failure (mdb.c _mdb_txn_commit).
+        (when-not @committed?
+          (mdb-txn-abort txn))
+        (throw e)))))
 
 (defn get-bytes
   "Value bytes for key k in txn, or nil."
@@ -220,6 +224,7 @@
     (try (check "env_copy2" (mdb-env-copy2 (live-env db) p MDB_CP_COMPACT))
          (finally (ffi/free p)))))
 
+(def MDB_MAP_FULL -30792)
 (def MDB_MAP_RESIZED -30785)
 
 (defn- env-map-bytes [env]
@@ -326,26 +331,78 @@
               (recur (inc tries)))
           res)))))
 
+(defn- map-full? [e]
+  (let [d (ex-data e)]
+    (and (= :lmdb-error (:type d))
+         (= MDB_MAP_FULL (:rc d)))))
+
+(defn- align-page ^long [^long n]
+  ;; 16 KiB covers both 4 KiB (x86_64/Linux) and 16 KiB (Apple Silicon macOS).
+  (let [pg 16384]
+    (* (quot (+ n (dec pg)) pg) pg)))
+
+(defn grow-mapsize!
+  "Acquires db's exclusive write lock (draining all local read/write txns so munmap is safe)
+  and grows the LMDB map size past `seen-bytes` (doubling, at least +1 MiB, 16 KiB aligned).
+  First adopts any larger size another process may already have committed via mdb_env_set_mapsize(env, 0).
+  Returns the new map size in bytes."
+  [db ^long seen-bytes]
+  (let [^java.util.concurrent.locks.ReentrantReadWriteLock rw (:rw-lock db)
+        wl (when rw (.writeLock rw))]
+    (when wl (.lock wl))
+    (try
+      (let [env (live-env db)
+            before (long (env-map-bytes env))]
+        (if (> before seen-bytes)
+          before
+          (do
+            (adopt-mapsize-unlocked! db)
+            (let [adopted (long (env-map-bytes env))]
+              (if (> adopted seen-bytes)
+                adopted
+                (let [base (max before adopted seen-bytes)
+                      target (align-page (max (* 2 base) (+ base (* 1024 1024))))]
+                  (check "env_set_mapsize" (mdb-env-set-mapsize env target))
+                  (long (env-map-bytes env))))))))
+      (finally (when wl (.unlock wl))))))
+
+(defn- run-write-txn [db f]
+  (let [^java.util.concurrent.locks.ReentrantReadWriteLock rw (:rw-lock db)]
+    (loop [grows 0]
+      (let [[rl txn] (begin-locked db 0)
+            seen (long (env-map-bytes (live-env db)))
+            res (try
+                  [:ok (commit-or-abort txn f)]
+                  (catch Throwable e
+                    (if (and (map-full? e)
+                             (< grows 16)
+                             (or (nil? rw) (= 1 (.getReadHoldCount rw))))
+                      [:full seen]
+                      (throw e)))
+                  (finally (when rl (.unlock rl))))]
+        (if (= :full (nth res 0))
+          (do (grow-mapsize! db (nth res 1))
+              (recur (inc grows)))
+          (nth res 1))))))
+
 (defn transact
   "Run (f) with every read-txn and write-txn of this thread inside one write transaction:
-  committed when f returns, aborted when it throws. LMDB has one writer per env across
-  processes, so nothing interleaves with it. Answers f's value."
+  committed when f returns, aborted when it throws. Automatically grows the LMDB map size on
+  MDB_MAP_FULL and retries. LMDB has one writer per env across processes, so nothing interleaves
+  with it. Answers f's value."
   [db f]
   (if *txn*
     (f)
-    (let [[rl txn] (begin-locked db 0)]
-      (try (commit-or-abort txn (fn [t] (binding [*txn* t] (f))))
-           (finally (when rl (.unlock rl)))))))
+    (run-write-txn db (fn [t] (binding [*txn* t] (f))))))
 
 (defn write-txn
-  "Run (f txn) in a write transaction and commit it; abort on exception. Inside
-  `transact`, f runs in its transaction, which commits when `transact` ends."
+  "Run (f txn) in a write transaction and commit it; abort on exception. Automatically grows
+  the LMDB map size on MDB_MAP_FULL and retries. Inside `transact`, f runs in its transaction,
+  which commits when `transact` ends."
   [db f]
   (if-some [t *txn*]
     (f t)
-    (let [[rl txn] (begin-locked db 0)]
-      (try (commit-or-abort txn f)
-           (finally (when rl (.unlock rl)))))))
+    (run-write-txn db f)))
 
 (defn read-txn
   "Run (f txn) in a read-only transaction (in `transact`'s, when one is open)."
